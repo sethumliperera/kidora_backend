@@ -165,13 +165,37 @@ router.post("/link", async (req, res) => {
 // ===============================
 router.get("/", verifyToken, async (req, res) => {
   try {
-    const parent_id = req.user.id;
+    const firebase_uid = req.user.firebase_uid;
+
+    console.log("Firebase UID:", firebase_uid);
+
+    // 🔍 Get correct parent_id from DB
+    const [parentResults] = await db.query(
+      "SELECT id FROM users WHERE firebase_uid = ?",
+      [firebase_uid]
+    );
+
+    if (parentResults.length === 0) {
+      console.log("No parent found");
+      return res.json([]);
+    }
+
+    const parent_id = parentResults[0].id;
+
+    console.log("Correct parent_id:", parent_id);
+
+    // ✅ Fetch children
     const [results] = await db.query(
       "SELECT * FROM children WHERE parent_id = ?",
       [parent_id]
     );
+
+    console.log("Children found:", results.length);
+
     res.json(results);
+
   } catch (err) {
+    console.error("GET CHILDREN ERROR:", err);
     res.status(500).json(err);
   }
 });
