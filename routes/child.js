@@ -43,12 +43,15 @@ router.post("/upload-photo", verifyToken, upload.single("photo"), (req, res) => 
 // ===============================
 router.post("/add", async (req, res) => {
   try {
-    const { firebase_uid, name, age, gender, interests, photo_url } = req.body;
+    const { firebase_uid, name, age, gender, interests, photo_url, email } = req.body;
 
-    if (!firebase_uid || !name || age === undefined) {
-      return res.status(400).json({ message: "firebase_uid, name and age are required" });
+    if (!firebase_uid || !name || age === undefined || !email) {
+      return res.status(400).json({
+        message: "firebase_uid, name, age and email are required"
+      });
     }
 
+    // 1️⃣ Find parent
     // 1️⃣ Find parent
     const [parentResults] = await db.query(
       "SELECT id FROM users WHERE firebase_uid = ?",
@@ -62,7 +65,7 @@ router.post("/add", async (req, res) => {
     } else {
       const [insertParent] = await db.query(
         "INSERT INTO users (firebase_uid, email, role) VALUES (?, ?, 'parent')",
-        [firebase_uid, null]
+        [firebase_uid, email] // ✅ FIXED HERE
       );
       parent_id = insertParent.insertId;
     }
