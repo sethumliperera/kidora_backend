@@ -1,8 +1,16 @@
-require("dotenv").config(); // ✅ ADD THIS FIRST
+require("dotenv").config({ path: "./.env" }); // ✅ Load environment variables FIRST
+console.log(process.env.MYSQLHOST);
+console.log(process.env.MYSQLUSER);
+console.log(process.env.MYSQLPASSWORD);
+console.log(process.env.MYSQLDATABASE);
+console.log(process.env.MYSQLPORT);
 
 const express = require("express");
 const cors = require("cors");
 const app = express();
+
+// ✅ Import DB (IMPORTANT)
+const db = require("./db");
 
 // ================= MIDDLEWARE =================
 
@@ -53,17 +61,35 @@ app.use("/api/block-apps", blockAppsRoutes);
 const notificationRoutes = require("./routes/notifications");
 app.use("/api/notifications", notificationRoutes);
 
-// Test route
+// ================= TEST ROUTES =================
+
+// Basic test
 app.get("/", (req, res) => {
-  res.send("Kidora Backend Running");
+  res.send("Kidora Backend Running ✅");
+});
+
+// 🔥 DATABASE TEST ROUTE (VERY IMPORTANT)
+app.get("/test-db", async (req, res) => {
+  try {
+    const [rows] = await db.query("SELECT 1");
+    res.json({
+      message: "Database connected successfully ✅",
+      result: rows
+    });
+  } catch (err) {
+    console.error("DB ERROR:", err);
+    res.status(500).json({
+      message: "Database connection failed ❌",
+      error: err.message
+    });
+  }
 });
 
 // ================= SERVER =================
 
-// 🔥 IMPORTANT FIX FOR RENDER
 const PORT = process.env.PORT || 3000;
 
-// Listen on all network interfaces
+// Listen on all network interfaces (important for mobile testing)
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Server running on port ${PORT}`);
+  console.log(`🚀 Server running on port ${PORT}`);
 });
