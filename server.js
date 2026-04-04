@@ -1,6 +1,7 @@
+require("dotenv").config(); // ✅ ADD THIS FIRST
+
 const express = require("express");
 const cors = require("cors");
-
 const app = express();
 
 // ================= MIDDLEWARE =================
@@ -54,7 +55,7 @@ app.use("/api/notifications", notificationRoutes);
 
 // Test route
 app.get("/", (req, res) => {
-  res.send("Kidora Backend Running 🚀");
+  res.send("Kidora Backend Running");
 });
 
 // ================= SERVER =================
