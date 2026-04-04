@@ -35,13 +35,17 @@ router.post("/upload-photo", verifyToken, upload.single("photo"), (req, res) => 
   res.json({ photo_url: photoUrl });
 });
 
-// 2. ADD CHILD (UPDATED)
+// 2. ADD CHILD (FULL FIXED)
 router.post("/add", (req, res) => {
   const { firebase_uid, name, age, gender, interests, photo_url } = req.body;
 
+  console.log("REQUEST BODY:", req.body); // ✅ DEBUG
+
   // validation
-  if (!firebase_uid || !name || !age) {
-    return res.status(400).json({ message: "firebase_uid, name and age are required" });
+  if (!firebase_uid || !name || age === undefined || age === null) {
+    return res.status(400).json({
+      message: "firebase_uid, name and age are required"
+    });
   }
 
   // 1. Find parent using firebase_uid
@@ -50,7 +54,10 @@ router.post("/add", (req, res) => {
   db.query(findParentSql, [firebase_uid], (err, parentResults) => {
     if (err) {
       console.error("Parent lookup error:", err);
-      return res.status(500).json({ message: "Database error", error: err });
+      return res.status(500).json({
+        message: "Database error",
+        error: err
+      });
     }
 
     if (parentResults.length === 0) {
@@ -62,33 +69,43 @@ router.post("/add", (req, res) => {
     // 2. Generate child codes
     const { childId, linkingCode } = generateUniqueCodes();
 
-    // 3. Insert child
+    // 3. Insert child (SAFE VALUES)
     const insertSql = `
       INSERT INTO children 
       (name, age, gender, interests, photo_url, child_id, linking_code, parent_id) 
       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `;
 
-    db.query(
-      insertSql,
-      [name, age, gender, interests, photo_url, childId, linkingCode, parent_id],
-      (err, result) => {
-        if (err) {
-          console.error("Insert child error:", err);
-          return res.status(500).json({
-            message: "Failed to add child",
-            error: err
-          });
-        }
+    const values = [
+      name,
+      age,
+      gender || null,
+      interests || null,
+      photo_url || null,
+      childId,
+      linkingCode,
+      parent_id
+    ];
 
-        res.json({
-          id: result.insertId,
-          message: "Child added successfully",
-          child_id: childId,
-          linking_code: linkingCode
+    console.log("INSERT VALUES:", values); // ✅ DEBUG
+
+    db.query(insertSql, values, (err, result) => {
+      if (err) {
+        console.error("Insert child error FULL:", err); // 🔥 FULL ERROR
+
+        return res.status(500).json({
+          message: "Database error",
+          error: err.sqlMessage || err.message
         });
       }
-    );
+
+      res.json({
+        id: result.insertId,
+        message: "Child added successfully",
+        child_id: childId,
+        linking_code: linkingCode
+      });
+    });
   });
 });
 
@@ -277,4 +294,4 @@ router.post("/:id/usage", (req, res) => {
   });
 });
 
-module.exports = router;
+module.exports = router;s
