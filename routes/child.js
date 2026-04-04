@@ -53,7 +53,7 @@ router.post("/add", async (req, res) => {
 
     // 1️⃣ Find parent
     const [parentResults] = await db.query(
-      "SELECT id FROM users WHERE firebase_uid = ? OR email = ?",
+      "SELECT id, firebase_uid FROM users WHERE firebase_uid = ? OR email = ?",
       [firebase_uid, email]
     );
 
@@ -61,10 +61,21 @@ router.post("/add", async (req, res) => {
 
     if (parentResults.length > 0) {
       parent_id = parentResults[0].id;
+      const existingUid = parentResults[0].firebase_uid;
+      
+      // ✅ SYNC UID: If UID was missing or different, update it
+      if (!existingUid || existingUid !== firebase_uid) {
+        console.log(`Syncing Firebase UID for parent ID ${parent_id}`);
+        await db.query(
+          "UPDATE users SET firebase_uid = ? WHERE id = ?",
+          [firebase_uid, parent_id]
+        );
+      }
     } else {
+      console.log(`Creating new parent record for ${email}`);
       const [insertParent] = await db.query(
         "INSERT INTO users (firebase_uid, email, role) VALUES (?, ?, 'parent')",
-        [firebase_uid, email] // ✅ FIXED HERE
+        [firebase_uid, email]
       );
       parent_id = insertParent.insertId;
     }
