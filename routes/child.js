@@ -36,32 +36,59 @@ router.post("/upload-photo", verifyToken, upload.single("photo"), (req, res) => 
 });
 
 // 2. ADD CHILD (UPDATED)
-router.post("/add", verifyToken, (req, res) => {
-  const { name, age, gender, interests, photo_url } = req.body;
-  const parent_id = req.user.id;
+router.post("/add", (req, res) => {
+  const { firebase_uid, name, age, gender, interests, photo_url } = req.body;
 
-  if (!name || !age) {
-    return res.status(400).json({ message: "Name and age are required" });
+  // validation
+  if (!firebase_uid || !name || !age) {
+    return res.status(400).json({ message: "firebase_uid, name and age are required" });
   }
 
-  const { childId, linkingCode } = generateUniqueCodes();
+  // 1. Find parent using firebase_uid
+  const findParentSql = "SELECT id FROM users WHERE firebase_uid = ?";
 
-  const sql = `
-    INSERT INTO children (name, age, gender, interests, photo_url, child_id, linking_code, parent_id) 
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `;
-
-  db.query(sql, [name, age, gender, interests, photo_url, childId, linkingCode, parent_id], (err, result) => {
+  db.query(findParentSql, [firebase_uid], (err, parentResults) => {
     if (err) {
-      console.error(err);
-      return res.status(500).json({ message: "Failed to add child", error: err });
+      console.error("Parent lookup error:", err);
+      return res.status(500).json({ message: "Database error", error: err });
     }
-    res.json({
-      id: result.insertId,
-      message: "Child added successfully",
-      child_id: childId,
-      linking_code: linkingCode
-    });
+
+    if (parentResults.length === 0) {
+      return res.status(404).json({ message: "Parent not found" });
+    }
+
+    const parent_id = parentResults[0].id;
+
+    // 2. Generate child codes
+    const { childId, linkingCode } = generateUniqueCodes();
+
+    // 3. Insert child
+    const insertSql = `
+      INSERT INTO children 
+      (name, age, gender, interests, photo_url, child_id, linking_code, parent_id) 
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `;
+
+    db.query(
+      insertSql,
+      [name, age, gender, interests, photo_url, childId, linkingCode, parent_id],
+      (err, result) => {
+        if (err) {
+          console.error("Insert child error:", err);
+          return res.status(500).json({
+            message: "Failed to add child",
+            error: err
+          });
+        }
+
+        res.json({
+          id: result.insertId,
+          message: "Child added successfully",
+          child_id: childId,
+          linking_code: linkingCode
+        });
+      }
+    );
   });
 });
 
