@@ -90,20 +90,24 @@ router.post("/add", async (req, res) => {
       [name, parseInt(age), gender || null, interests || null, photo_url || null, childId, parent_id]
     );
 
-    const child_id = childResult.insertId;
+    const child_id_db = childResult.insertId;
 
-    // 3️⃣ Generate linking code (NEW SYSTEM)
+    // 3️⃣ Fetch full child record to return to UI
+    const [newChildRows] = await db.query("SELECT * FROM children WHERE id = ?", [child_id_db]);
+    const newChild = newChildRows[0];
+
+    // 4️⃣ Generate linking code (NEW SYSTEM)
     const code = generateLinkingCode();
     const expiresAt = new Date(Date.now() + 5 * 60 * 1000);
 
     await db.query(
       "INSERT INTO linking_codes (parent_id, child_id, code, expires_at, is_used) VALUES (?, ?, ?, ?, 0)",
-      [parent_id, child_id, code, expiresAt]
+      [parent_id, child_id_db, code, expiresAt]
     );
 
     res.json({
       message: "Child added successfully",
-      child_id: childId,
+      child: newChild,
       linking_code: code
     });
 
