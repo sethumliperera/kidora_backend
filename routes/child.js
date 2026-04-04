@@ -49,7 +49,14 @@ router.post("/add", (req, res) => {
   // 1. Find or create parent
   const findParentSql = "SELECT id FROM users WHERE firebase_uid = ?";
   db.query(findParentSql, [firebase_uid], (err, parentResults) => {
-    if (err) return res.status(500).json({ message: "Database lookup error", error: err });
+    if (err) {
+      console.error("LOOKUP ERROR FULL:", err); // 🔥 IMPORTANT
+
+      return res.status(500).json({
+        message: "Database lookup error",
+        error: err.sqlMessage || err.message
+      });
+    }
 
     const handleChildInsert = (parent_id) => {
       const { childId, linkingCode } = generateUniqueCodes();
