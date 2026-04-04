@@ -52,10 +52,9 @@ router.post("/add", async (req, res) => {
     }
 
     // 1️⃣ Find parent
-    // 1️⃣ Find parent
     const [parentResults] = await db.query(
-      "SELECT id FROM users WHERE firebase_uid = ?",
-      [firebase_uid]
+      "SELECT id FROM users WHERE firebase_uid = ? OR email = ?",
+      [firebase_uid, email]
     );
 
     let parent_id;
