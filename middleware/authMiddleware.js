@@ -21,7 +21,7 @@ const verifyToken = async (req, res, next) => {
     const decodedToken = await admin.auth().verifyIdToken(token);
     console.log(`Token verified for Firebase UID: ${decodedToken.uid}`);
 
-    // 🔍 Fetch the MySQL user ID using firebase_uid
+    // 🔍 Get user from MySQL using firebase_uid
     const sql = "SELECT id FROM users WHERE firebase_uid = ?";
     db.query(sql, [decodedToken.uid], (err, results) => {
       if (err) {
@@ -34,11 +34,18 @@ const verifyToken = async (req, res, next) => {
         return res.status(404).json({ message: "User not found in database" });
       }
 
-      // ✅ Attach BOTH Firebase info and MySQL ID to req.user
-      req.user = { ...decodedToken, id: results[0].id };
-      console.log(`Middleware complete. req.user.id set to: ${req.user.id}`);
+      // ✅ FIX: explicitly map fields
+      req.user = {
+        id: results[0].id,                // MySQL parent_id
+        firebase_uid: decodedToken.uid,  // 🔥 IMPORTANT FIX
+        email: decodedToken.email
+      };
+
+      console.log("Middleware user object:", req.user);
+
       next();
     });
+
   } catch (error) {
     console.error("Auth Error details:", error);
     return res.status(401).json({ message: "Invalid token" });
