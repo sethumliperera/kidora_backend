@@ -236,6 +236,7 @@ router.delete("/:id", verifyToken, async (req, res) => {
     res.status(500).json(err);
   }
 });
+
 // ===============================
 // 📱 GET APP CONTROLS FOR CHILD
 // ===============================
@@ -243,26 +244,23 @@ router.get("/:id/apps", async (req, res) => {
   try {
     const child_id = req.params.id;
 
-    // Auto-create table if missing
-    await db.query(`
-      CREATE TABLE IF NOT EXISTS app_controls (
-        id INT AUTO_INCREMENT PRIMARY KEY,
-        child_id INT NOT NULL,
-        app_name VARCHAR(100) NOT NULL,
-        time_limit INT DEFAULT 60,
-        time_used INT DEFAULT 0,
-        is_blocked TINYINT(1) DEFAULT 0,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-        UNIQUE KEY unique_child_app (child_id, app_name)
-      )
-    `);
-
-    const [results] = await db.query(
+    // 1️⃣ Fetch time-limited app controls
+    const [controls] = await db.query(
       "SELECT * FROM app_controls WHERE child_id = ?",
       [child_id]
     );
 
-    res.json(results);
+    // 2️⃣ Fetch strictly blocked package names
+    // No verifyToken needed here as this is for the child device
+    const [blocked] = await db.query(
+      "SELECT package_name FROM blocked_apps WHERE child_id = ?",
+      [child_id]
+    );
+
+    res.json({
+      controls,
+      blocked_packages: blocked.map(b => b.package_name)
+    });
   } catch (err) {
     console.error("GET APP CONTROLS ERROR:", err);
     res.status(500).json({ message: "Failed to fetch app controls", error: err.message });
