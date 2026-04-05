@@ -59,7 +59,7 @@ router.get("/:child_id", verifyToken, async (req, res) => {
 
     // Merge installed apps with block status from blocked_apps table
     const [results] = await db.query(`
-      SELECT 
+      SELECT DISTINCT
         ia.package_name,
         ia.app_name,
         CASE WHEN ba.id IS NOT NULL THEN 1 ELSE 0 END AS is_blocked
@@ -67,6 +67,7 @@ router.get("/:child_id", verifyToken, async (req, res) => {
       LEFT JOIN blocked_apps ba 
         ON ia.child_id = ba.child_id AND ia.package_name = ba.package_name
       WHERE ia.child_id = ?
+      GROUP BY ia.package_name, ia.app_name
       ORDER BY ia.app_name ASC
     `, [child_id]);
 
