@@ -23,28 +23,23 @@ const verifyToken = async (req, res, next) => {
 
     // 🔍 Get user from MySQL using firebase_uid
     const sql = "SELECT id FROM users WHERE firebase_uid = ?";
-    db.query(sql, [decodedToken.uid], (err, results) => {
-      if (err) {
-        console.error("Database error in middleware:", err);
-        return res.status(500).json({ message: "Database error during authentication" });
-      }
+    const [results] = await db.query(sql, [decodedToken.uid]);
 
-      if (results.length === 0) {
-        console.warn(`User not found in MySQL for UID: ${decodedToken.uid}`);
-        return res.status(404).json({ message: "User not found in database" });
-      }
+    if (results.length === 0) {
+      console.warn(`User not found in MySQL for UID: ${decodedToken.uid}`);
+      return res.status(404).json({ message: "User not found in database" });
+    }
 
-      // ✅ FIX: explicitly map fields
-      req.user = {
-        id: results[0].id,                // MySQL parent_id
-        firebase_uid: decodedToken.uid,  // 🔥 IMPORTANT FIX
-        email: decodedToken.email
-      };
+    // ✅ FIX: explicitly map fields
+    req.user = {
+      id: results[0].id,                // MySQL parent_id
+      firebase_uid: decodedToken.uid,  // 🔥 IMPORTANT FIX
+      email: decodedToken.email
+    };
 
-      console.log("Middleware user object:", req.user);
+    console.log("Middleware user object:", req.user);
 
-      next();
-    });
+    next();
 
   } catch (error) {
     console.error("Auth Error details:", error);
