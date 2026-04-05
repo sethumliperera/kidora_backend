@@ -6,14 +6,15 @@ const verifyToken = require("../middleware/authMiddleware");
 // BLOCK APP
 router.post("/block", verifyToken, async (req, res) => {
   try {
-    const { child_id, app_name } = req.body;
+    const { child_id, package_name } = req.body;
 
     const sql = `
-      INSERT INTO blocked_apps (child_id, app_name)
+      INSERT INTO blocked_apps (child_id, package_name)
       VALUES (?, ?)
     `;
 
-    await db.query(sql, [child_id, app_name]);
+    await db.query(sql, [child_id, package_name]);
+
     res.json({ message: "App blocked successfully" });
   } catch (err) {
     console.error("Error blocking app:", err);
@@ -26,8 +27,9 @@ router.get("/:child_id", verifyToken, async (req, res) => {
   try {
     const { child_id } = req.params;
 
-    const sql = "SELECT * FROM blocked_apps WHERE child_id = ?";
+    const sql = "SELECT package_name FROM blocked_apps WHERE child_id = ?";
     const [results] = await db.query(sql, [child_id]);
+
     res.json(results);
   } catch (err) {
     console.error("Error fetching blocked apps:", err);
@@ -38,14 +40,15 @@ router.get("/:child_id", verifyToken, async (req, res) => {
 // UNBLOCK APP
 router.delete("/unblock", verifyToken, async (req, res) => {
   try {
-    const { child_id, app_name } = req.body;
+    const { child_id, package_name } = req.body;
 
     const sql = `
       DELETE FROM blocked_apps
-      WHERE child_id = ? AND app_name = ?
+      WHERE child_id = ? AND package_name = ?
     `;
 
-    await db.query(sql, [child_id, app_name]);
+    await db.query(sql, [child_id, package_name]);
+
     res.json({ message: "App unblocked successfully" });
   } catch (err) {
     console.error("Error unblocking app:", err);
