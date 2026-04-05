@@ -236,6 +236,100 @@ router.delete("/:id", verifyToken, async (req, res) => {
     res.status(500).json(err);
   }
 });
+// ===============================
+// 📱 GET APP CONTROLS FOR CHILD
+// ===============================
+router.get("/:id/apps", async (req, res) => {
+  try {
+    const child_id = req.params.id;
+
+    // Auto-create table if missing
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS app_controls (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        child_id INT NOT NULL,
+        app_name VARCHAR(100) NOT NULL,
+        time_limit INT DEFAULT 60,
+        time_used INT DEFAULT 0,
+        is_blocked TINYINT(1) DEFAULT 0,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        UNIQUE KEY unique_child_app (child_id, app_name)
+      )
+    `);
+
+    const [results] = await db.query(
+      "SELECT * FROM app_controls WHERE child_id = ?",
+      [child_id]
+    );
+
+    res.json(results);
+  } catch (err) {
+    console.error("GET APP CONTROLS ERROR:", err);
+    res.status(500).json({ message: "Failed to fetch app controls", error: err.message });
+  }
+});
+
+// ===============================
+// 🚫 CREATE / UPDATE APP CONTROL
+// ===============================
+router.post("/:id/apps", async (req, res) => {
+  try {
+    const child_id = req.params.id;
+    const { app_name, time_limit, is_blocked } = req.body;
+
+    if (!app_name) {
+      return res.status(400).json({ message: "app_name is required" });
+    }
+
+    // Auto-create table if missing
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS app_controls (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        child_id INT NOT NULL,
+        app_name VARCHAR(100) NOT NULL,
+        time_limit INT DEFAULT 60,
+        time_used INT DEFAULT 0,
+        is_blocked TINYINT(1) DEFAULT 0,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        UNIQUE KEY unique_child_app (child_id, app_name)
+      )
+    `);
+
+    const updateFields = [];
+    const values = [];
+
+    if (time_limit !== undefined) {
+      updateFields.push("time_limit = ?");
+      values.push(time_limit);
+    }
+    if (is_blocked !== undefined) {
+      updateFields.push("is_blocked = ?");
+      values.push(is_blocked ? 1 : 0);
+    }
+
+    if (updateFields.length === 0) {
+      // Just register the app with defaults
+      await db.query(
+        `INSERT INTO app_controls (child_id, app_name) VALUES (?, ?)
+         ON DUPLICATE KEY UPDATE child_id = child_id`,
+        [child_id, app_name]
+      );
+    } else {
+      values.push(child_id, app_name);
+      await db.query(
+        `INSERT INTO app_controls (child_id, app_name, ${updateFields.map(f => f.split(" = ")[0]).join(", ")})
+         VALUES (?, ?, ${updateFields.map(() => "?").join(", ")})
+         ON DUPLICATE KEY UPDATE ${updateFields.join(", ")}`,
+        [child_id, app_name, ...values.slice(0, updateFields.length)]
+      );
+    }
+
+    res.json({ message: "App control updated successfully" });
+  } catch (err) {
+    console.error("UPDATE APP CONTROL ERROR:", err);
+    res.status(500).json({ message: "Failed to update app control", error: err.message });
+  }
+});
 
 // ===============================
 // 📡 UPDATE PRESENCE (HEARTBEAT)
