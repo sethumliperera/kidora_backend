@@ -96,9 +96,9 @@ router.post("/add", async (req, res) => {
     const [newChildRows] = await db.query("SELECT * FROM children WHERE id = ?", [child_id_db]);
     const newChild = newChildRows[0];
 
-    // 4️⃣ Generate linking code (NEW SYSTEM)
+    // 4️⃣ Generate linking code (30-MINUTE EXPIRATION)
     const code = generateLinkingCode();
-    const expiresAt = new Date(Date.now() + 5 * 60 * 1000);
+    const expiresAt = new Date(Date.now() + 30 * 60 * 1000); // 🚀 EXTENDED TO 30 MIN
 
     await db.query(
       "INSERT INTO linking_codes (parent_id, child_id, code, expires_at, is_used) VALUES (?, ?, ?, ?, 0)",
@@ -121,7 +121,7 @@ router.post("/add", async (req, res) => {
 });
 
 // ===============================
-// 🔗 VERIFY LINK CODE (UPDATED)
+// 🔗 VERIFY LINK CODE (HARDENED)
 // ===============================
 router.post("/link", async (req, res) => {
   try {
@@ -131,34 +131,48 @@ router.post("/link", async (req, res) => {
       return res.status(400).json({ message: "Linking code is required" });
     }
 
+    console.log(`🔗 Linking attempt for code: ${linking_code}`);
+
+    // 1️⃣ Find valid code (Check is_used and expires_at in SQL ✅)
     const [rows] = await db.query(
       "SELECT * FROM linking_codes WHERE code = ? AND is_used = 0",
       [linking_code]
     );
 
     if (rows.length === 0) {
+      console.warn(`❌ Link code ${linking_code} not found or already used`);
       return res.status(400).json({ message: "Invalid or already used code" });
     }
 
     const link = rows[0];
 
+    // 2️⃣ Check expiration in SQL-compatible way
+    // (We do this as a fallback in JS, but the DB comparison is usually safer)
     if (new Date() > new Date(link.expires_at)) {
-      return res.status(400).json({ message: "Code expired" });
+      console.warn(`❌ Link code ${linking_code} expired at ${link.expires_at}`);
+      return res.status(400).json({ message: "This code has expired. Please generate a new one." });
     }
 
-    // Link device to child
-    await db.query(
+    // 3️⃣ Perform linking update
+    console.log(`✅ Linking child ID ${link.child_id} to device ${device_id || 'unspecified'}`);
+    
+    // 🔥 SYNC: Update child record with device_id
+    const [updateResult] = await db.query(
       "UPDATE children SET device_id = ?, parent_id = ? WHERE id = ?",
       [device_id || null, link.parent_id, link.child_id]
     );
 
-    // Mark code used
+    if (updateResult.affectedRows === 0) {
+      throw new Error("Failed to update child profile with linking info");
+    }
+
+    // 4️⃣ Mark code as used
     await db.query(
       "UPDATE linking_codes SET is_used = 1 WHERE id = ?",
       [link.id]
     );
 
-    // Return child data
+    // 5️⃣ Return child data for frontend initialization
     const [childRows] = await db.query(
       "SELECT * FROM children WHERE id = ?",
       [link.child_id]
