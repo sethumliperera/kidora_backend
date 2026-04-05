@@ -238,7 +238,42 @@ router.delete("/:id", verifyToken, async (req, res) => {
 });
 
 // ===============================
-// (KEEP REST OF YOUR CODE SAME)
+// 📡 UPDATE PRESENCE (HEARTBEAT)
 // ===============================
+router.post("/presence", async (req, res) => {
+  try {
+    const { child_id, status } = req.body;
+    
+    // Auto-migrate columns if necessary
+    try {
+      await db.query("ALTER TABLE children ADD COLUMN app_status VARCHAR(20) DEFAULT 'offline'");
+      await db.query("ALTER TABLE children ADD COLUMN last_active_at TIMESTAMP NULL DEFAULT NULL");
+    } catch (e) {
+      // Ignore dup field errors
+    }
+
+    if (!child_id || !status) {
+      return res.status(400).json({ message: "child_id and status are required" });
+    }
+
+    const [result] = await db.query(
+      "UPDATE children SET app_status = ?, last_active_at = NOW() WHERE child_id = ?",
+      [status, child_id]
+    );
+
+    if (result.affectedRows === 0) {
+      // Also try fallback to id
+      await db.query(
+        "UPDATE children SET app_status = ?, last_active_at = NOW() WHERE id = ?",
+        [status, child_id]
+      );
+    }
+
+    res.json({ message: "Presence updated successfully" });
+  } catch (err) {
+    console.error("PRESENCE ERROR:", err);
+    res.status(500).json({ message: "Failed to update presence", error: err.message });
+  }
+});
 
 module.exports = router;
