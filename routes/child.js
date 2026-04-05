@@ -180,24 +180,9 @@ router.post("/link", async (req, res) => {
 // ===============================
 router.get("/", verifyToken, async (req, res) => {
   try {
-    const firebase_uid = req.user.firebase_uid;
+    const parent_id = req.user.id;
 
-    console.log("Firebase UID:", firebase_uid);
-
-    // 🔍 Get correct parent_id from DB
-    const [parentResults] = await db.query(
-      "SELECT id FROM users WHERE firebase_uid = ?",
-      [firebase_uid]
-    );
-
-    if (parentResults.length === 0) {
-      console.log("No parent found");
-      return res.json([]);
-    }
-
-    const parent_id = parentResults[0].id;
-
-    console.log("Correct parent_id:", parent_id);
+    console.log("Fetching children for parent_id:", parent_id);
 
     // ✅ Fetch children
     const [results] = await db.query(
@@ -211,7 +196,7 @@ router.get("/", verifyToken, async (req, res) => {
 
   } catch (err) {
     console.error("GET CHILDREN ERROR:", err);
-    res.status(500).json(err);
+    res.status(500).json({ message: "Failed to fetch children", error: err.message });
   }
 });
 
