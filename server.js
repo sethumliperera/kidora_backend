@@ -61,6 +61,11 @@ app.use("/api/block-apps", blockAppsRoutes);
 const notificationRoutes = require("./routes/notifications");
 app.use("/api/notifications", notificationRoutes);
 
+// Installed Apps routes
+const installedAppsRoutes = require("./routes/installedApps");
+app.use("/api/installed-apps", installedAppsRoutes);
+
+
 // ================= TEST ROUTES =================
 
 // Basic test
