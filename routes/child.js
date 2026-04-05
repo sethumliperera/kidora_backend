@@ -154,12 +154,12 @@ router.post("/link", async (req, res) => {
     }
 
     // 3️⃣ Perform linking update
-    console.log(`✅ Linking child ID ${link.child_id} to device ${device_id || 'unspecified'}`);
+    console.log(`✅ Linking child ID ${link.child_id}`);
     
-    // 🔥 SYNC: Update child record with device_id
+    // 🔥 SYNC: Update child record
     const [updateResult] = await db.query(
-      "UPDATE children SET device_id = ?, parent_id = ? WHERE id = ?",
-      [device_id || null, link.parent_id, link.child_id]
+      "UPDATE children SET parent_id = ? WHERE id = ?",
+      [link.parent_id, link.child_id]
     );
 
     if (updateResult.affectedRows === 0) {
