@@ -334,12 +334,15 @@ router.post("/:id/apps", async (req, res) => {
 // ===============================
 router.post("/presence", async (req, res) => {
   try {
-    const { child_id, status } = req.body;
+    const { child_id, status, current_app, rt_day, rt_today_seconds } = req.body;
     
     // Auto-migrate columns if necessary
     try {
       await db.query("ALTER TABLE children ADD COLUMN app_status VARCHAR(20) DEFAULT 'offline'");
       await db.query("ALTER TABLE children ADD COLUMN last_active_at TIMESTAMP NULL DEFAULT NULL");
+      await db.query("ALTER TABLE children ADD COLUMN current_app VARCHAR(255) DEFAULT NULL");
+      await db.query("ALTER TABLE children ADD COLUMN rt_day VARCHAR(10) DEFAULT NULL");
+      await db.query("ALTER TABLE children ADD COLUMN rt_today_seconds INT DEFAULT 0");
     } catch (e) {
       // Ignore dup field errors
     }
@@ -348,16 +351,32 @@ router.post("/presence", async (req, res) => {
       return res.status(400).json({ message: "child_id and status are required" });
     }
 
+    const updates = ["app_status = ?", "last_active_at = NOW()"];
+    const values = [status];
+
+    if (current_app !== undefined) {
+      updates.push("current_app = ?");
+      values.push(current_app);
+    }
+    if (rt_day !== undefined) {
+      updates.push("rt_day = ?");
+      values.push(rt_day);
+    }
+    if (rt_today_seconds !== undefined) {
+      updates.push("rt_today_seconds = ?");
+      values.push(Number(rt_today_seconds) || 0);
+    }
+
     const [result] = await db.query(
-      "UPDATE children SET app_status = ?, last_active_at = NOW() WHERE child_id = ?",
-      [status, child_id]
+      `UPDATE children SET ${updates.join(", ")} WHERE child_id = ?`,
+      [...values, child_id]
     );
 
     if (result.affectedRows === 0) {
       // Also try fallback to id
       await db.query(
-        "UPDATE children SET app_status = ?, last_active_at = NOW() WHERE id = ?",
-        [status, child_id]
+        `UPDATE children SET ${updates.join(", ")} WHERE id = ?`,
+        [...values, child_id]
       );
     }
 
