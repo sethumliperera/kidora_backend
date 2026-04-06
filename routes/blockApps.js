@@ -33,7 +33,10 @@ router.post("/block", verifyToken, async (req, res) => {
 });
 
 // GET BLOCKED APPS
-router.get("/:child_id", verifyToken, async (req, res) => {
+// IMPORTANT: This is used by the child device background monitor to enforce blocks.
+// The child app does not require Firebase auth for reads, so we intentionally
+// do NOT verify token here.
+router.get("/:child_id", async (req, res) => {
   try {
     await ensureTable();
     const { child_id } = req.params;
