@@ -56,6 +56,15 @@ router.get("/:child_id", verifyToken, async (req, res) => {
     await ensureTable();
 
     const { child_id } = req.params;
+    const parentId = req.user.id;
+
+    const [owned] = await db.query(
+      "SELECT id FROM children WHERE id = ? AND parent_id = ?",
+      [child_id, parentId]
+    );
+    if (owned.length === 0) {
+      return res.status(404).json({ error: "Child not found or access denied" });
+    }
 
     // Merge installed apps with block status from blocked_apps table
     const [results] = await db.query(`
