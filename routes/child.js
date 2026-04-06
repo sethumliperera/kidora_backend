@@ -368,4 +368,54 @@ router.post("/presence", async (req, res) => {
   }
 });
 
+// ===============================
+// 📊 RECORD APP USAGE (INCREMENTAL)
+// ===============================
+router.post("/:id/usage", async (req, res) => {
+  try {
+    const child_id = req.params.id;
+    const { app_name, additional_minutes } = req.body;
+
+    if (!app_name || additional_minutes === undefined) {
+      return res.status(400).json({ message: "app_name and additional_minutes are required" });
+    }
+
+    // Ensure table exists
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS app_controls (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        child_id INT NOT NULL,
+        app_name VARCHAR(100) NOT NULL,
+        time_limit INT DEFAULT 60,
+        time_used INT DEFAULT 0,
+        is_blocked TINYINT(1) DEFAULT 0,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        UNIQUE KEY unique_child_app (child_id, app_name)
+      )
+    `);
+
+    // Increment time_used for this app
+    await db.query(
+      `INSERT INTO app_controls (child_id, app_name, time_used) 
+       VALUES (?, ?, ?) 
+       ON DUPLICATE KEY UPDATE time_used = time_used + ?`,
+      [child_id, app_name, additional_minutes, additional_minutes]
+    );
+
+    // Also record in app_usage table so the parent dashboard sees it!
+    // We record this as a 1-minute session (or whatever additional_minutes is) 
+    // starting NOW.
+    await db.query(
+      `INSERT INTO app_usage (child_id, app_name, start_time, end_time, duration_seconds) 
+       VALUES (?, ?, NOW(), NOW(), ?)`,
+      [child_id, app_name, additional_minutes * 60]
+    );
+
+    res.json({ message: "Usage recorded and synced to history" });
+  } catch (err) {
+    console.error("USAGE RECORD ERROR:", err);
+    res.status(500).json({ message: "Failed to record usage", error: err.message });
+  }
+});
+
 module.exports = router;
