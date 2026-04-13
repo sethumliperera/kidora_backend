@@ -65,6 +65,9 @@ app.use("/api/notifications", notificationRoutes);
 const installedAppsRoutes = require("./routes/installedApps");
 app.use("/api/installed-apps", installedAppsRoutes);
 
+// Reminder routes
+const reminderRoutes = require("./routes/reminders");
+app.use("/api/reminders", reminderRoutes);
 
 // ================= TEST ROUTES =================
 
