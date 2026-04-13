@@ -506,4 +506,39 @@ router.post("/:id/reminders", async (req, res) => {
   }
 });
 
+// ===============================
+// 🔔 SAVE FCM TOKEN (CHILD DEVICE)
+// ===============================
+router.post("/save-fcm-token", async (req, res) => {
+  try {
+    const { child_id, fcm_token } = req.body;
+
+    if (!child_id || !fcm_token) {
+      return res.status(400).json({
+        message: "child_id and fcm_token are required",
+      });
+    }
+
+    const [result] = await db.query(
+      "UPDATE children SET fcm_token = ? WHERE id = ?",
+      [fcm_token, child_id]
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({
+        message: "Child not found",
+      });
+    }
+
+    console.log(" FCM token saved for child:", child_id);
+
+    res.json({ message: "FCM token saved successfully" });
+
+  } catch (err) {
+    console.error("FCM TOKEN ERROR:", err);
+    res.status(500).json({
+      message: "Failed to save FCM token",
+    });
+  }
+});
 module.exports = router;
