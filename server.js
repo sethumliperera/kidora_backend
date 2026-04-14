@@ -103,5 +103,5 @@ const PORT = process.env.PORT || 3000;
 
 // Listen on all network interfaces (important for mobile testing)
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`Server running on port ${PORT}`);
 });
