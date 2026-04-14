@@ -70,7 +70,7 @@ const reminderRoutes = require("./routes/reminders");
 app.use("/api/reminders", reminderRoutes);
 
 //Restriction routes
-const reminderRoutes = require("./routes/reminders");
+const restrictionRoutes = require("./routes/reminders");
 app.use("/api/restrictions", require("./restriction"));
 
 // ================= TEST ROUTES =================
