@@ -33,15 +33,78 @@ router.post("/", async (req, res) => {
       return res.status(400).json({ error: "child_id must be a number" });
     }
 
-    const [childRows] = await db.query("SELECT id FROM children WHERE id = ?", [numericChildId]);
+    const [childRows] = await db.query(
+      "SELECT id, parent_id FROM children WHERE id = ?",
+      [numericChildId]
+    );
     if (childRows.length === 0) {
       return res.status(404).json({ error: "Unknown child_id — link this device again." });
     }
 
-    // Clear old apps list for this child
+    const parentId = childRows[0].parent_id;
+
+    // ── Step 1: Remember existing package names (for new-install detection) ──
+    const [existingRows] = await db.query(
+      "SELECT package_name FROM installed_apps WHERE child_id = ?",
+      [numericChildId]
+    );
+    const existingPackages = new Set(existingRows.map((r) => r.package_name));
+
+    // ── Step 2: Detect newly installed apps ──
+    const SOCIAL_GAMING_KEYWORDS = [
+      "facebook", "instagram", "tiktok", "musically", "snapchat",
+      "twitter", "whatsapp", "telegram", "discord", "reddit",
+      "youtube", "netflix", "spotify", "twitch", "pinterest",
+      "game", "gaming", "pubg", "roblox", "minecraft", "fortnite",
+      "chess", "ludo", "candy", "clash", "angry", "temple",
+      "subway", "racing", "shooter", "battle", "arena",
+    ];
+
+    const isSocialOrGaming = (pkg, name) => {
+      const p = (pkg || "").toLowerCase();
+      const n = (name || "").toLowerCase();
+      return SOCIAL_GAMING_KEYWORDS.some((kw) => p.includes(kw) || n.includes(kw));
+    };
+
+    const newApps = apps.filter(
+      (a) => !existingPackages.has(a.package_name)
+    );
+
+    // ── Step 3: Create notifications for newly installed apps ──
+    if (newApps.length > 0 && parentId) {
+      // Ensure notifications table exists
+      await db.query(`
+        CREATE TABLE IF NOT EXISTS notifications (
+          id INT AUTO_INCREMENT PRIMARY KEY,
+          parent_id INT,
+          child_id INT NOT NULL,
+          message TEXT NOT NULL,
+          type VARCHAR(100) DEFAULT 'general',
+          is_read TINYINT DEFAULT 0,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+      `);
+
+      for (const app of newApps) {
+        const appLabel = app.app_name || app.package_name;
+        const category = isSocialOrGaming(app.package_name, app.app_name)
+          ? " (Social/Gaming)"
+          : "";
+        const message = `Your child just installed ${appLabel}${category}`;
+        try {
+          await db.query(
+            "INSERT INTO notifications (parent_id, child_id, message, type) VALUES (?, ?, ?, ?)",
+            [parentId, numericChildId, message, "new_app_installed"]
+          );
+        } catch (e) {
+          console.error("Failed to create notification:", e.message);
+        }
+      }
+    }
+
+    // ── Step 4: Clear old apps and re-insert ──
     await db.query("DELETE FROM installed_apps WHERE child_id = ?", [numericChildId]);
 
-    // Batch insert new apps
     for (const app of apps) {
       try {
         await db.query(
@@ -53,7 +116,10 @@ router.post("/", async (req, res) => {
       }
     }
 
-    res.json({ message: `${apps.length} apps saved successfully` });
+    res.json({
+      message: `${apps.length} apps saved successfully`,
+      new_installs: newApps.length,
+    });
   } catch (err) {
     console.error("Error saving installed apps:", err);
     res.status(500).json({ error: err.message });
