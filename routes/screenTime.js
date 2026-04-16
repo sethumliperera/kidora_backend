@@ -34,7 +34,7 @@ router.get("/check/:child_id", async (req, res) => {
 
     console.log("CHECK API HIT for child:", child_id);
 
-    // Get total usage (today only)
+    // Total usage for today
     const usageSql = `
       SELECT SUM(duration_seconds) as total_usage
       FROM app_usage
@@ -54,7 +54,6 @@ router.get("/check/:child_id", async (req, res) => {
     const [limitResult] = await db.query(limitSql, [child_id]);
     const limit = limitResult[0]?.daily_limit || 0;
 
-    // Decide status
     let status = "OK";
 
     if (limit > 0) {
@@ -79,7 +78,7 @@ router.get("/check/:child_id", async (req, res) => {
 
 
 // ==========================
-// SAVE USAGE (FROM CHILD APP)
+// SAVE USAGE
 // ==========================
 router.post("/save-usage", async (req, res) => {
   try {
@@ -103,7 +102,7 @@ router.post("/save-usage", async (req, res) => {
 
 
 // ==========================
-// GET USAGE (FOR DASHBOARD)
+// GET USAGE (PARENT DASHBOARD)
 // ==========================
 router.get("/usage/:child_id", async (req, res) => {
   try {
