@@ -46,10 +46,13 @@ router.get("/check/:child_id", async (req, res) => {
 
     // Get limit
     const limitSql = `
-      SELECT daily_limit
-      FROM screen_time_limits
-      WHERE child_id = ?
-    `;
+  SELECT daily_limit_seconds
+  FROM screen_time_limits
+  WHERE child_id = ?
+`;
+
+const [limitResult] = await db.query(limitSql, [child_id]);
+const limit = limitResult[0]?.daily_limit_seconds || 0;
 
     const [limitResult] = await db.query(limitSql, [child_id]);
     const limit = limitResult[0]?.daily_limit || 0;
