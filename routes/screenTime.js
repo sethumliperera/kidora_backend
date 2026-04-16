@@ -10,10 +10,10 @@ router.post("/set", async (req, res) => {
     const { child_id, daily_limit } = req.body;
 
     const sql = `
-      INSERT INTO screen_time_limits (child_id, daily_limit)
-      VALUES (?, ?)
-      ON DUPLICATE KEY UPDATE daily_limit = VALUES(daily_limit)
-    `;
+  INSERT INTO screen_time_limits (child_id, daily_limit_seconds)
+  VALUES (?, ?)
+  ON DUPLICATE KEY UPDATE daily_limit_seconds = VALUES(daily_limit_seconds)
+`;
 
     await db.query(sql, [child_id, daily_limit]);
 
