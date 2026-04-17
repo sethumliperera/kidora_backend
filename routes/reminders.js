@@ -24,7 +24,9 @@ router.post("/send", verifyToken, async (req, res) => {
     );
 
     if (childRows.length === 0) {
-      return res.status(404).json({ message: "Child not found" });
+      return res.status(404).json({
+        message: "Child not found"
+      });
     }
 
     if (Number(childRows[0].parent_id) !== Number(parent_id)) {
@@ -42,37 +44,28 @@ router.post("/send", verifyToken, async (req, res) => {
 
     const reminder_id = result.insertId;
 
-    // 3️⃣ Emit via Socket
+    // 3️⃣ Emit via Socket (ALWAYS EMIT)
     const io = req.app.get("io");
-    let notification_sent = false;
 
     if (io) {
       const room = "child_" + child_id;
 
-      // check active connections
-      const sockets = await io.in(room).fetchSockets();
+      io.to(room).emit("reminder", {
+        title: "New Reminder",
+        message: message,
+        reminder_id: reminder_id,
+        time: new Date().toISOString()
+      });
 
-      if (sockets.length > 0) {
-        io.to(room).emit("reminder", {
-          title: "New Reminder",
-          message: message,
-          reminder_id: reminder_id,
-          time: new Date().toISOString()
-        });
-
-        notification_sent = true;
-        console.log(`✅ Sent reminder to ${room}`);
-      } else {
-        console.warn(`⚠️ No active sockets in ${room}`);
-      }
+      console.log(`✅ Reminder emitted to ${room}`);
     } else {
       console.warn("❌ Socket.io not initialized");
     }
 
     res.json({
-      message: "Reminder saved successfully",
+      message: "Reminder sent successfully",
       reminder_id,
-      notification_sent
+      notification_sent: true
     });
 
   } catch (err) {
@@ -97,11 +90,15 @@ router.get("/child/:child_id", verifyToken, async (req, res) => {
     );
 
     if (childRows.length === 0) {
-      return res.status(404).json({ message: "Child not found" });
+      return res.status(404).json({
+        message: "Child not found"
+      });
     }
 
     if (Number(childRows[0].parent_id) !== Number(parent_id)) {
-      return res.status(403).json({ message: "Unauthorized" });
+      return res.status(403).json({
+        message: "Unauthorized"
+      });
     }
 
     const [results] = await db.query(
@@ -111,36 +108,13 @@ router.get("/child/:child_id", verifyToken, async (req, res) => {
       [child_id, parent_id]
     );
 
-    res.json(results);
-
-  } catch (err) {
-    console.error("GET REMINDERS ERROR:", err);
-    res.status(500).json({
-      error: "Failed to fetch reminders"
+    res.json({
+      message: "Reminders fetched successfully",
+      data: results
     });
-  }
-});
-
-// ===============================
-// 📥 GET ALL REMINDERS (PARENT)
-// ===============================
-router.get("/", verifyToken, async (req, res) => {
-  try {
-    const parent_id = req.user.id;
-
-    const [results] = await db.query(
-      `SELECT r.*, c.name AS child_name
-       FROM reminders r
-       JOIN children c ON r.child_id = c.id
-       WHERE r.parent_id = ?
-       ORDER BY r.sent_at DESC`,
-      [parent_id]
-    );
-
-    res.json(results);
 
   } catch (err) {
-    console.error("GET ALL REMINDERS ERROR:", err);
+    console.error("GET CHILD REMINDERS ERROR:", err);
     res.status(500).json({
       error: "Failed to fetch reminders"
     });
@@ -161,7 +135,10 @@ router.get("/received/:child_id", async (req, res) => {
       [child_id]
     );
 
-    res.json(results);
+    res.json({
+      message: "Received reminders fetched successfully",
+      data: results
+    });
 
   } catch (err) {
     console.error("GET RECEIVED ERROR:", err);
@@ -191,7 +168,9 @@ router.put("/:id/read", async (req, res) => {
       });
     }
 
-    res.json({ message: "Marked as read" });
+    res.json({
+      message: "Reminder marked as read"
+    });
 
   } catch (err) {
     console.error("READ ERROR:", err);
@@ -231,39 +210,14 @@ router.delete("/:id", verifyToken, async (req, res) => {
       [id]
     );
 
-    res.json({ message: "Deleted successfully" });
+    res.json({
+      message: "Reminder deleted successfully"
+    });
 
   } catch (err) {
     console.error("DELETE ERROR:", err);
     res.status(500).json({
       error: "Failed to delete reminder"
-    });
-  }
-});
-
-// ===============================
-// 📊 STATS
-// ===============================
-router.get("/stats/all", verifyToken, async (req, res) => {
-  try {
-    const parent_id = req.user.id;
-
-    const [stats] = await db.query(
-      `SELECT 
-          COUNT(*) AS total,
-          SUM(is_read = 1) AS read_count,
-          SUM(is_read = 0) AS unread_count
-       FROM reminders
-       WHERE parent_id = ?`,
-      [parent_id]
-    );
-
-    res.json(stats[0]);
-
-  } catch (err) {
-    console.error("STATS ERROR:", err);
-    res.status(500).json({
-      error: "Failed to fetch stats"
     });
   }
 });
