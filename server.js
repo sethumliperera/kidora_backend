@@ -64,6 +64,12 @@ const io = new Server(server, {
 app.set("io", io);
 
 // ===============================
+//  SCHEDULER
+// ===============================
+const scheduler = require("./scheduler");
+scheduler.init(io);
+
+// ===============================
 //  SOCKET EVENTS
 // ===============================
 io.on("connection", (socket) => {
