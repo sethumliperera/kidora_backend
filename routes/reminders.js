@@ -33,7 +33,7 @@ router.post("/send", verifyToken, async (req, res) => {
       [child_id]
     );
 
-    if (childRows.length === 0) {
+    if (!childRows.length) {
       return res.status(404).json({ message: "Child not found" });
     }
 
@@ -42,7 +42,7 @@ router.post("/send", verifyToken, async (req, res) => {
     }
 
     // ===============================
-    // 2. INSERT REMINDER (NEW TABLE FIXED)
+    // 2. SAVE REMINDER
     // ===============================
     const [result] = await db.query(
       `INSERT INTO reminders 
@@ -72,7 +72,7 @@ router.post("/send", verifyToken, async (req, res) => {
     };
 
     // ===============================
-    // 3. SOCKET EMIT (SAFE)
+    // 3. SOCKET EMIT
     // ===============================
     const io = req.app.get("io");
 
@@ -80,9 +80,15 @@ router.post("/send", verifyToken, async (req, res) => {
       !scheduled_at ||
       new Date(scheduled_at) <= new Date(Date.now() + 5000);
 
+    const room = `child_${child_id}`;
+
     if (isImmediate && io) {
-      io.to("child_" + child_id).emit("reminder", {
-        title: priority === "urgent" ? "🚨 Urgent Reminder" : "📢 Reminder",
+      console.log("📡 Emitting reminder to room:", room);
+
+      io.to(room).emit("reminder", {
+        title: priority === "urgent"
+          ? "🚨 Urgent Reminder"
+          : "📢 Reminder",
         message,
         reminder_id,
         priority,
@@ -94,10 +100,12 @@ router.post("/send", verifyToken, async (req, res) => {
         "UPDATE reminders SET is_sent = 1, sent_at = NOW() WHERE id = ?",
         [reminder_id]
       );
+    } else {
+      console.log("⏳ Reminder scheduled for later:", room);
     }
 
     // ===============================
-    // 4. SCHEDULER (SAFE IMPORT)
+    // 4. OPTIONAL SCHEDULER
     // ===============================
     try {
       const scheduler = require("../scheduler");
@@ -105,8 +113,8 @@ router.post("/send", verifyToken, async (req, res) => {
       if (frequency !== "once" || !isImmediate) {
         scheduler.scheduleReminder(reminderData);
       }
-    } catch (e) {
-      console.log("Scheduler not active or failed:", e.message);
+    } catch (err) {
+      console.log("⚠ Scheduler not available:", err.message);
     }
 
     // ===============================
@@ -120,13 +128,14 @@ router.post("/send", verifyToken, async (req, res) => {
     });
 
   } catch (err) {
-    console.error("🔥 SEND REMINDER ERROR FULL:", err);
+    console.error("🔥 SEND REMINDER ERROR:", err);
 
     return res.status(500).json({
       error: err.sqlMessage || err.message || "Failed to process reminder"
     });
   }
 });
+
 
 // ===============================
 // 📥 GET REMINDERS (PARENT VIEW)
@@ -167,8 +176,9 @@ router.get("/child/:child_id", verifyToken, async (req, res) => {
   }
 });
 
+
 // ===============================
-// 📥 CHILD VIEW (ALL RECEIVED)
+// 📥 CHILD VIEW
 // ===============================
 router.get("/received/:child_id", async (req, res) => {
   try {
@@ -191,6 +201,7 @@ router.get("/received/:child_id", async (req, res) => {
     res.status(500).json({ error: "Failed to fetch reminders" });
   }
 });
+
 
 // ===============================
 // ✔ MARK AS READ
@@ -217,6 +228,7 @@ router.put("/:id/read", async (req, res) => {
     res.status(500).json({ error: "Failed to update reminder" });
   }
 });
+
 
 // ===============================
 // 🗑 DELETE REMINDER
