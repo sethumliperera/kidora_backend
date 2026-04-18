@@ -9,7 +9,13 @@ const verifyToken = require("../middleware/authMiddleware");
 router.post("/send", verifyToken, async (req, res) => {
   try {
     const parent_id = req.user.id;
-    const { child_id, message } = req.body;
+    const { 
+      child_id, 
+      message, 
+      priority = "normal", 
+      scheduled_at = null, 
+      frequency = "once" 
+    } = req.body;
 
     if (!child_id || !message) {
       return res.status(400).json({
@@ -37,41 +43,64 @@ router.post("/send", verifyToken, async (req, res) => {
 
     // 2️⃣ Save reminder
     const [result] = await db.query(
-      `INSERT INTO reminders (parent_id, child_id, message)
-       VALUES (?, ?, ?)`,
-      [parent_id, child_id, message]
+      `INSERT INTO reminders (child_id, title, message, priority, scheduled_at, frequency, is_active)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [child_id, req.body.title || "New Reminder", message, priority, scheduled_at, frequency, 1]
     );
 
     const reminder_id = result.insertId;
 
-    // 3️⃣ Emit via Socket (ALWAYS EMIT)
+    const reminderData = {
+      id: reminder_id,
+      child_id,
+      title: req.body.title || "New Reminder",
+      message,
+      priority,
+      scheduled_at,
+      frequency
+    };
+
+    // 3️⃣ Determine if it should be sent immediately or scheduled
+    const scheduler = require("../scheduler");
     const io = req.app.get("io");
+    
+    const isFuture = scheduled_at && new Date(scheduled_at) > new Date(Date.now() + 5000);
 
-    if (io) {
-      const room = "child_" + child_id;
+    if (!isFuture) {
+      // Send immediately if time is now or roughly now
+      if (io) {
+        const room = "child_" + child_id;
+        io.to(room).emit("reminder", {
+          title: priority === "urgent" ? "🚨 Urgent Reminder!" : "📢 New Reminder",
+          message: message,
+          reminder_id: reminder_id,
+          priority,
+          time: new Date().toISOString()
+        });
+        console.log(`✅ Immediate reminder emitted to ${room}`);
+      }
 
-      io.to(room).emit("reminder", {
-        title: "New Reminder",
-        message: message,
-        reminder_id: reminder_id,
-        time: new Date().toISOString()
-      });
+      // If it was a one-time reminder, mark it as inactive since it's already sent
+      if (frequency === "once") {
+        await db.query("UPDATE reminders SET is_active = 0 WHERE id = ?", [reminder_id]);
+      }
+    }
 
-      console.log(`✅ Reminder emitted to ${room}`);
-    } else {
-      console.warn("❌ Socket.io not initialized");
+    // If it's a repeating reminder OR a future one-time reminder, add to scheduler
+    if (frequency !== "once" || isFuture) {
+      scheduler.scheduleReminder(reminderData);
     }
 
     res.json({
-      message: "Reminder sent successfully",
+      message: isFuture ? "Reminder scheduled successfully" : "Reminder sent successfully",
       reminder_id,
-      notification_sent: true
+      scheduled: isFuture || frequency !== "once"
     });
 
   } catch (err) {
     console.error("SEND REMINDER ERROR:", err);
     res.status(500).json({
-      error: "Failed to send reminder"
+      error: "Failed to process reminder"
     });
   }
 });
