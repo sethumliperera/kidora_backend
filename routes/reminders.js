@@ -20,14 +20,10 @@ router.post("/send", verifyToken, async (req, res) => {
     } = req.body;
 
     if (!child_id || !message) {
-      return res.status(400).json({
-        message: "child_id and message are required"
-      });
+      return res.status(400).json({ message: "child_id and message are required" });
     }
 
-    // ===============================
     // 1. VERIFY CHILD OWNERSHIP
-    // ===============================
     const [childRows] = await db.query(
       "SELECT id, parent_id FROM children WHERE id = ?",
       [child_id]
@@ -41,95 +37,74 @@ router.post("/send", verifyToken, async (req, res) => {
       return res.status(403).json({ message: "Unauthorized" });
     }
 
-    // ===============================
-    // 2. SAVE REMINDER
-    // ===============================
+    // 2. INSERT REMINDER
     const [result] = await db.query(
       `INSERT INTO reminders 
       (parent_id, child_id, title, message, priority, scheduled_at, frequency, is_sent, is_read)
       VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0)`,
-      [
-        parent_id,
-        child_id,
-        title,
-        message,
-        priority,
-        scheduled_at,
-        frequency
-      ]
+      [parent_id, child_id, title, message, priority, scheduled_at, frequency]
     );
 
     const reminder_id = result.insertId;
 
-    const reminderData = {
-      id: reminder_id,
-      child_id,
-      title,
-      message,
-      priority,
-      scheduled_at,
-      frequency
-    };
-
-    // ===============================
     // 3. SOCKET EMIT
-    // ===============================
     const io = req.app.get("io");
 
     const isImmediate =
       !scheduled_at ||
-      new Date(scheduled_at) <= new Date(Date.now() + 5000);
+      new Date(scheduled_at).getTime() <= Date.now() + 5000;
 
     const room = `child_${child_id}`;
 
-    if (isImmediate && io) {
-      console.log("📡 Emitting reminder to room:", room);
+    console.log("📡 Target room:", room);
 
-      io.to(room).emit("reminder", {
-        title: priority === "urgent"
-          ? "🚨 Urgent Reminder"
-          : "📢 Reminder",
+    if (io && isImmediate) {
+      const payload = {
+        title: priority === "urgent" ? "🚨 Urgent Reminder" : "📢 Reminder",
         message,
         reminder_id,
         priority,
         time: new Date().toISOString()
-      });
+      };
 
-      // mark as sent
+      console.log("📤 Emitting reminder:", payload);
+
+      io.to(room).emit("reminder", payload);
+
       await db.query(
         "UPDATE reminders SET is_sent = 1, sent_at = NOW() WHERE id = ?",
         [reminder_id]
       );
     } else {
-      console.log("⏳ Reminder scheduled for later:", room);
+      console.log("⏳ Not emitted (scheduled or io missing)");
     }
 
-    // ===============================
     // 4. OPTIONAL SCHEDULER
-    // ===============================
     try {
       const scheduler = require("../scheduler");
 
       if (frequency !== "once" || !isImmediate) {
-        scheduler.scheduleReminder(reminderData);
+        scheduler.scheduleReminder({
+          id: reminder_id,
+          child_id,
+          title,
+          message,
+          priority,
+          scheduled_at,
+          frequency
+        });
       }
     } catch (err) {
-      console.log("⚠ Scheduler not available:", err.message);
+      console.log("⚠ Scheduler not active:", err.message);
     }
 
-    // ===============================
-    // RESPONSE
-    // ===============================
     return res.json({
-      message: isImmediate
-        ? "Reminder sent successfully"
-        : "Reminder scheduled successfully",
+      message: isImmediate ? "Reminder sent" : "Reminder scheduled",
       reminder_id
     });
 
   } catch (err) {
     console.error("🔥 SEND REMINDER ERROR:", err);
-
     return res.status(500).json({
       error: err.sqlMessage || err.message || "Failed to process reminder"
     });
@@ -145,16 +120,14 @@ router.get("/child/:child_id", verifyToken, async (req, res) => {
     const parent_id = req.user.id;
     const { child_id } = req.params;
 
-    const [childRows] = await db.query(
+    const [rows] = await db.query(
       "SELECT parent_id FROM children WHERE id = ?",
       [child_id]
     );
 
-    if (!childRows.length) {
-      return res.status(404).json({ message: "Child not found" });
-    }
+    if (!rows.length) return res.status(404).json({ message: "Child not found" });
 
-    if (Number(childRows[0].parent_id) !== Number(parent_id)) {
+    if (Number(rows[0].parent_id) !== Number(parent_id)) {
       return res.status(403).json({ message: "Unauthorized" });
     }
 
@@ -165,13 +138,10 @@ router.get("/child/:child_id", verifyToken, async (req, res) => {
       [child_id, parent_id]
     );
 
-    res.json({
-      message: "Reminders fetched successfully",
-      data: results
-    });
+    res.json({ data: results });
 
   } catch (err) {
-    console.error("GET CHILD REMINDERS ERROR:", err);
+    console.error("GET ERROR:", err);
     res.status(500).json({ error: "Failed to fetch reminders" });
   }
 });
@@ -191,13 +161,10 @@ router.get("/received/:child_id", async (req, res) => {
       [child_id]
     );
 
-    res.json({
-      message: "Received reminders fetched successfully",
-      data: results
-    });
+    res.json({ data: results });
 
   } catch (err) {
-    console.error("GET RECEIVED ERROR:", err);
+    console.error("RECEIVED ERROR:", err);
     res.status(500).json({ error: "Failed to fetch reminders" });
   }
 });
@@ -210,28 +177,22 @@ router.put("/:id/read", async (req, res) => {
   try {
     const { id } = req.params;
 
-    const [result] = await db.query(
-      `UPDATE reminders
-       SET is_read = 1, read_at = NOW()
-       WHERE id = ?`,
+    await db.query(
+      "UPDATE reminders SET is_read = 1, read_at = NOW() WHERE id = ?",
       [id]
     );
 
-    if (!result.affectedRows) {
-      return res.status(404).json({ message: "Reminder not found" });
-    }
-
-    res.json({ message: "Reminder marked as read" });
+    res.json({ message: "Marked as read" });
 
   } catch (err) {
-    console.error("READ ERROR:", err);
-    res.status(500).json({ error: "Failed to update reminder" });
+    console.error(err);
+    res.status(500).json({ error: "Failed to update" });
   }
 });
 
 
 // ===============================
-// 🗑 DELETE REMINDER
+// 🗑 DELETE
 // ===============================
 router.delete("/:id", verifyToken, async (req, res) => {
   try {
@@ -243,21 +204,19 @@ router.delete("/:id", verifyToken, async (req, res) => {
       [id]
     );
 
-    if (!rows.length) {
-      return res.status(404).json({ message: "Reminder not found" });
-    }
+    if (!rows.length) return res.status(404).json({ message: "Not found" });
 
-    if (Number(rows[0].parent_id) !== Number(parent_id)) {
+    if (rows[0].parent_id !== parent_id) {
       return res.status(403).json({ message: "Unauthorized" });
     }
 
     await db.query("DELETE FROM reminders WHERE id = ?", [id]);
 
-    res.json({ message: "Reminder deleted successfully" });
+    res.json({ message: "Deleted" });
 
   } catch (err) {
-    console.error("DELETE ERROR:", err);
-    res.status(500).json({ error: "Failed to delete reminder" });
+    console.error(err);
+    res.status(500).json({ error: "Delete failed" });
   }
 });
 
