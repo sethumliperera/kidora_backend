@@ -43,9 +43,9 @@ router.post("/send", verifyToken, async (req, res) => {
 
     // 2️⃣ Save reminder
     const [result] = await db.query(
-      `INSERT INTO reminders (child_id, title, message, priority, scheduled_at, frequency, is_active)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      [child_id, req.body.title || "New Reminder", message, priority, scheduled_at, frequency, 1]
+      `INSERT INTO reminders (parent_id, child_id, title, message, priority, scheduled_at, frequency, is_active)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [parent_id, child_id, req.body.title || "New Reminder", message, priority, scheduled_at, frequency, 1]
     );
 
     const reminder_id = result.insertId;
