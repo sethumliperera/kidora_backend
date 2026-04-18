@@ -391,10 +391,10 @@ router.get("/:id/schedules", async (req, res) => {
     const formatted = rows.map(r => ({
       ...r,
       days: JSON.parse(r.days || "[]"),
-      blockedApps: JSON.parse(r.blocked_apps || "[]"),
-      startTime: r.start_time,
-      endTime: r.end_time,
-      isEnabled: r.is_enabled === 1
+      blocked_packages: JSON.parse(r.blocked_apps || "[]"),
+      start_time: r.start_time,
+      end_time: r.end_time,
+      is_enabled: r.is_enabled === 1
     }));
 
     res.json(formatted);
@@ -408,7 +408,7 @@ router.get("/:id/schedules", async (req, res) => {
 router.post("/:id/schedules", async (req, res) => {
   try {
     const child_id = req.params.id;
-    const { id, name, startTime, endTime, days, blockedApps, isEnabled } = req.body;
+    const { id, name, start_time, end_time, days, blocked_packages, is_enabled } = req.body;
 
     // Auto-create table if missing (consistent with child.js pattern)
     await db.query(`
@@ -428,16 +428,16 @@ router.post("/:id/schedules", async (req, res) => {
     `);
 
     const daysJson = JSON.stringify(days || []);
-    const blockedAppsJson = JSON.stringify(blockedApps || []);
-    const enabled = isEnabled ? 1 : 0;
+    const blockedAppsJson = JSON.stringify(blocked_packages || []);
+    const enabled = is_enabled ? 1 : 0;
 
-    if (id) {
+    if (id && isNaN(id) === false) {
       // Update existing
       await db.query(
         `UPDATE app_restriction_schedules 
          SET name = ?, start_time = ?, end_time = ?, days = ?, blocked_apps = ?, is_enabled = ?
          WHERE id = ? AND child_id = ?`,
-        [name, startTime, endTime, daysJson, blockedAppsJson, enabled, id, child_id]
+        [name, start_time, end_time, daysJson, blockedAppsJson, enabled, id, child_id]
       );
       res.json({ message: "Schedule updated successfully" });
     } else {
@@ -446,7 +446,7 @@ router.post("/:id/schedules", async (req, res) => {
         `INSERT INTO app_restriction_schedules 
          (child_id, name, start_time, end_time, days, blocked_apps, is_enabled)
          VALUES (?, ?, ?, ?, ?, ?, ?)`,
-        [child_id, name, startTime, endTime, daysJson, blockedAppsJson, enabled]
+        [child_id, name, start_time, end_time, daysJson, blockedAppsJson, enabled]
       );
       res.json({ message: "Schedule created successfully", id: result.insertId });
     }
@@ -475,5 +475,6 @@ router.delete("/:id/schedules/:scheduleId", async (req, res) => {
     res.status(500).json({ message: "Failed to delete schedule", error: err.message });
   }
 });
+
 
 module.exports = router;
