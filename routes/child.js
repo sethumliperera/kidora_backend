@@ -374,5 +374,106 @@ router.post("/save-fcm-token", async (req, res) => {
 
   res.json({ message: "Saved" });
 });
+// ===============================
+// 📅 APP RESTRICTION SCHEDULES
+// ===============================
+
+// 1. GET ALL SCHEDULES
+router.get("/:id/schedules", async (req, res) => {
+  try {
+    const child_id = req.params.id;
+    const [rows] = await db.query(
+      "SELECT * FROM app_restriction_schedules WHERE child_id = ?",
+      [child_id]
+    );
+
+    // Format for frontend (Parse JSON strings)
+    const formatted = rows.map(r => ({
+      ...r,
+      days: JSON.parse(r.days || "[]"),
+      blockedApps: JSON.parse(r.blocked_apps || "[]"),
+      startTime: r.start_time,
+      endTime: r.end_time,
+      isEnabled: r.is_enabled === 1
+    }));
+
+    res.json(formatted);
+  } catch (err) {
+    console.error("GET SCHEDULES ERROR:", err);
+    res.status(500).json({ message: "Failed to fetch schedules", error: err.message });
+  }
+});
+
+// 2. CREATE or UPDATE SCHEDULE (Standardized POST)
+router.post("/:id/schedules", async (req, res) => {
+  try {
+    const child_id = req.params.id;
+    const { id, name, startTime, endTime, days, blockedApps, isEnabled } = req.body;
+
+    // Auto-create table if missing (consistent with child.js pattern)
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS app_restriction_schedules (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        child_id INT NOT NULL,
+        name VARCHAR(255) NOT NULL,
+        start_time VARCHAR(10) NOT NULL,
+        end_time VARCHAR(10) NOT NULL,
+        days TEXT NOT NULL,
+        blocked_apps TEXT NOT NULL,
+        is_enabled TINYINT(1) DEFAULT 1,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        FOREIGN KEY (child_id) REFERENCES children(id) ON DELETE CASCADE
+      )
+    `);
+
+    const daysJson = JSON.stringify(days || []);
+    const blockedAppsJson = JSON.stringify(blockedApps || []);
+    const enabled = isEnabled ? 1 : 0;
+
+    if (id) {
+      // Update existing
+      await db.query(
+        `UPDATE app_restriction_schedules 
+         SET name = ?, start_time = ?, end_time = ?, days = ?, blocked_apps = ?, is_enabled = ?
+         WHERE id = ? AND child_id = ?`,
+        [name, startTime, endTime, daysJson, blockedAppsJson, enabled, id, child_id]
+      );
+      res.json({ message: "Schedule updated successfully" });
+    } else {
+      // Create new
+      const [result] = await db.query(
+        `INSERT INTO app_restriction_schedules 
+         (child_id, name, start_time, end_time, days, blocked_apps, is_enabled)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [child_id, name, startTime, endTime, daysJson, blockedAppsJson, enabled]
+      );
+      res.json({ message: "Schedule created successfully", id: result.insertId });
+    }
+  } catch (err) {
+    console.error("SAVE SCHEDULE ERROR:", err);
+    res.status(500).json({ message: "Failed to save schedule", error: err.message });
+  }
+});
+
+// 3. DELETE SCHEDULE
+router.delete("/:id/schedules/:scheduleId", async (req, res) => {
+  try {
+    const { id, scheduleId } = req.params;
+    const [result] = await db.query(
+      "DELETE FROM app_restriction_schedules WHERE id = ? AND child_id = ?",
+      [scheduleId, id]
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ message: "Schedule not found or unauthorized" });
+    }
+
+    res.json({ message: "Schedule deleted successfully" });
+  } catch (err) {
+    console.error("DELETE SCHEDULE ERROR:", err);
+    res.status(500).json({ message: "Failed to delete schedule", error: err.message });
+  }
+});
 
 module.exports = router;
