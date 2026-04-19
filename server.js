@@ -1,7 +1,7 @@
 require("dotenv").config({ path: "./.env" });
 
 // ===============================
-//  ENV DEBUG 
+//  ENV DEBUG
 // ===============================
 console.log("DB HOST:", process.env.MYSQLHOST);
 console.log("DB USER:", process.env.MYSQLUSER);
@@ -60,39 +60,48 @@ const io = new Server(server, {
   }
 });
 
-// make io accessible inside routes
+// 🔥 Make io available inside routes
 app.set("io", io);
-
-// ===============================
-//  SCHEDULER
-// ===============================
-const scheduler = require("./scheduler");
-scheduler.init(io);
 
 // ===============================
 //  SOCKET EVENTS
 // ===============================
 io.on("connection", (socket) => {
-  console.log(" Socket connected:", socket.id);
+  console.log("🟢 Socket connected:", socket.id);
 
-  //  CHILD JOINS ROOM
+  // ===============================
+  // 👶 CHILD JOINS ROOM
+  // ===============================
   socket.on("join_child", (childId) => {
-    const room = "child_" + childId;
+    const room = `child_${childId}`;
     socket.join(room);
-    console.log(` Child joined room: ${room}`);
+
+    console.log(`👶 Child joined room: ${room}`);
   });
 
-  //  PARENT JOINS ROOM (optional future use)
+  // ===============================
+  // 👨‍👩‍👧 PARENT JOINS ROOM (optional)
+  // ===============================
   socket.on("join_parent", (parentId) => {
-    const room = "parent_" + parentId;
+    const room = `parent_${parentId}`;
     socket.join(room);
-    console.log(` Parent joined room: ${room}`);
+
+    console.log(`👨‍👩‍👧 Parent joined room: ${room}`);
   });
 
+  // ===============================
+  // 🔴 DISCONNECT
+  // ===============================
   socket.on("disconnect", () => {
-    console.log(" Socket disconnected:", socket.id);
+    console.log("🔴 Socket disconnected:", socket.id);
   });
 });
+
+// ===============================
+//  SCHEDULER (after io is ready)
+// ===============================
+const scheduler = require("./scheduler");
+scheduler.init(io);
 
 // ===============================
 // ROUTES
@@ -126,7 +135,7 @@ app.use("/api/notifications", notificationRoutes);
 const installedAppsRoutes = require("./routes/installedApps");
 app.use("/api/installed-apps", installedAppsRoutes);
 
-// Reminders 
+// Reminders
 const reminderRoutes = require("./routes/reminders");
 app.use("/api/reminders", reminderRoutes);
 
@@ -138,9 +147,7 @@ app.use("/api/restrictions", restrictionRoutes);
 //  TEST ROUTES
 // ===============================
 app.get("/", (req, res) => {
-  res.json({
-    message: "Kidora Backend Running"
-  });
+  res.json({ message: "Kidora Backend Running" });
 });
 
 app.get("/test-db", async (req, res) => {
@@ -168,5 +175,5 @@ app.get("/test-db", async (req, res) => {
 const PORT = process.env.PORT || 3000;
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(` Server running on port ${PORT}`);
+  console.log(`🚀 Server running on port ${PORT}`);
 });
