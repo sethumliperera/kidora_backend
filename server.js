@@ -53,29 +53,32 @@ const io = new Server(server, {
 app.set("io", io);
 
 // ===============================
-// SOCKET EVENTS (FIXED)
+// SOCKET HELPERS
+// ===============================
+const sendToChild = (childId, event, data) => {
+  io.to(`child_${childId}`).emit(event, data);
+};
+
+const sendToParent = (parentId, event, data) => {
+  io.to(`parent_${parentId}`).emit(event, data);
+};
+
+// ===============================
+// SOCKET EVENTS
 // ===============================
 io.on("connection", (socket) => {
   console.log("🟢 Socket connected:", socket.id);
 
-  // 👶 CHILD JOIN
   socket.on("join_child", (childId) => {
     if (!childId) return;
-
-    const room = `child_${childId}`;
-    socket.join(room);
-
-    console.log(`👶 Joined room: ${room}`);
+    socket.join(`child_${childId}`);
+    console.log(`👶 Joined child room: child_${childId}`);
   });
 
-  // 👨 PARENT JOIN
   socket.on("join_parent", (parentId) => {
     if (!parentId) return;
-
-    const room = `parent_${parentId}`;
-    socket.join(room);
-
-    console.log(`👨 Joined room: ${room}`);
+    socket.join(`parent_${parentId}`);
+    console.log(`👨 Joined parent room: parent_${parentId}`);
   });
 
   socket.on("disconnect", () => {
@@ -102,6 +105,12 @@ app.use("/api/restrictions", require("./routes/restrictions"));
 app.get("/", (req, res) => {
   res.json({ message: "Kidora Backend Running" });
 });
+
+// ===============================
+// EXPORT HELPERS (optional use in routes)
+// ===============================
+app.set("sendToChild", sendToChild);
+app.set("sendToParent", sendToParent);
 
 // ===============================
 // START SERVER
