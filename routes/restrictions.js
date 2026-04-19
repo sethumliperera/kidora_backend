@@ -286,24 +286,46 @@ router.get("/active/:child_id", async (req, res) => {
     try {
         const { child_id } = req.params;
 
-        const [results] = await db.query(
-            `SELECT * FROM restrictions
-             WHERE child_id = ? AND enabled = 1`,
+        const now = new Date();
+
+        const currentMinutes = now.getHours() * 60 + now.getMinutes();
+
+        const days = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"];
+        const today = days[now.getDay()];
+
+        const [rows] = await db.query(
+            "SELECT * FROM restrictions WHERE child_id = ? AND enabled = 1",
             [child_id]
         );
 
-        const parsed = results.map(r => ({
-            ...r,
-            days: JSON.parse(r.days || "[]"),
-            blocked_apps: JSON.parse(r.blocked_apps || "[]")
-        }));
+        const activeRestrictions = rows.filter(r => {
+            if (!r.start_time || !r.end_time) return false;
 
-        res.json(parsed);
+            const start = parseTime(r.start_time);
+            const end = parseTime(r.end_time);
+
+            const restrictionDays = JSON.parse(r.days || "[]");
+
+            return (
+                restrictionDays.includes(today) &&
+                currentMinutes >= start &&
+                currentMinutes <= end
+            );
+        });
+
+        res.json(activeRestrictions);
 
     } catch (err) {
-        console.error("ACTIVE ERROR:", err);
-        res.status(500).json({ error: "Failed to fetch active restrictions" });
+        console.error("ACTIVE RESTRICTIONS ERROR:", err);
+        res.status(500).json({ error: "Failed to get active restrictions" });
     }
 });
+
+
+// helper
+function parseTime(timeStr) {
+    const [h, m] = timeStr.split(":").map(Number);
+    return h * 60 + m;
+}
 
 module.exports = router;
