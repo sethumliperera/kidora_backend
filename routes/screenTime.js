@@ -1,140 +1,212 @@
 const express = require("express");
 const router = express.Router();
 const db = require("../db");
+const verifyToken = require("../middleware/authMiddleware");
 
-// ==========================
-// SET SCREEN TIME LIMIT
-// ==========================
-router.post("/set", async (req, res) => {
+// ===============================
+// 🛠 AUTO-CREATE daily_screen_time TABLE
+// ===============================
+const ensureTable = async () => {
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS daily_screen_time (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      child_id INT NOT NULL,
+      app_name VARCHAR(255) NOT NULL,
+      date DATE NOT NULL,
+      duration_seconds INT DEFAULT 0,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      UNIQUE KEY unique_child_app_date (child_id, app_name, date),
+      INDEX idx_child_date (child_id, date)
+    )
+  `);
+};
+
+// ===============================
+// 💾 SAVE USAGE (from child background service)
+// POST /api/screen-time/save-usage
+// Body: { child_id, total_screen_time, usage: [{ app_name, duration }] }
+// ===============================
+router.post("/save-usage", async (req, res) => {
   try {
-    const { child_id, daily_limit } = req.body;
+    await ensureTable();
 
-    const sql = `
-      INSERT INTO screen_time_limits (child_id, daily_limit_seconds)
-      VALUES (?, ?)
-      ON DUPLICATE KEY UPDATE daily_limit_seconds = VALUES(daily_limit_seconds)
-    `;
+    const { child_id, total_screen_time, usage } = req.body;
 
-    await db.query(sql, [child_id, daily_limit]);
+    if (!child_id || !usage || !Array.isArray(usage)) {
+      return res.status(400).json({ error: "child_id and usage[] are required" });
+    }
 
-    console.log("Limit set for child:", child_id);
+    const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
 
-    res.json({ message: "Limit set successfully" });
+    // Upsert each app's usage for today
+    for (const app of usage) {
+      if (!app.app_name || app.duration === undefined) continue;
+
+      await db.query(
+        `INSERT INTO daily_screen_time (child_id, app_name, date, duration_seconds)
+         VALUES (?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE duration_seconds = VALUES(duration_seconds)`,
+        [child_id, app.app_name, today, Math.max(0, parseInt(app.duration) || 0)]
+      );
+    }
+
+    // Also update the children table for live presence polling
+    try {
+      await db.query(
+        `UPDATE children SET rt_day = ?, rt_today_seconds = ? WHERE id = ?`,
+        [today, Math.max(0, parseInt(total_screen_time) || 0), child_id]
+      );
+    } catch (e) {
+      // Columns might not exist yet — ignore
+      console.warn("Could not update rt_ columns:", e.message);
+    }
+
+    res.json({ message: "Usage saved successfully" });
   } catch (err) {
-    console.error("Error setting screen time limit:", err);
+    console.error("SAVE USAGE ERROR:", err);
     res.status(500).json({ error: "Database error", details: err.message });
   }
 });
 
+// ===============================
+// 📊 GET USAGE FOR A SPECIFIC DAY
+// GET /api/screen-time/usage/:child_id?date=YYYY-MM-DD
+// Returns: { date, total_screen_time, apps: [{ app_name, duration }] }
+// ===============================
+router.get("/usage/:child_id", async (req, res) => {
+  try {
+    await ensureTable();
 
-// ==========================
-// CHECK SCREEN TIME
-// ==========================
+    const { child_id } = req.params;
+    const date = req.query.date || new Date().toISOString().slice(0, 10);
+
+    const [results] = await db.query(
+      `SELECT app_name, duration_seconds as duration
+       FROM daily_screen_time
+       WHERE child_id = ? AND date = ?
+       ORDER BY duration_seconds DESC`,
+      [child_id, date]
+    );
+
+    let total_screen_time = 0;
+    const apps = results.map(row => {
+      const duration = parseInt(row.duration, 10) || 0;
+      total_screen_time += duration;
+      return {
+        app_name: row.app_name,
+        duration: duration
+      };
+    });
+
+    res.json({
+      date: date,
+      total_screen_time: total_screen_time,
+      apps: apps
+    });
+  } catch (err) {
+    console.error("GET USAGE ERROR:", err);
+    res.status(500).json({ error: "Database error", details: err.message });
+  }
+});
+
+// ===============================
+// 📅 GET USAGE HISTORY (Last N days)
+// GET /api/screen-time/usage/:child_id/history?days=7
+// Returns: [{ date, total_duration }]
+// ===============================
+router.get("/usage/:child_id/history", async (req, res) => {
+  try {
+    await ensureTable();
+
+    const { child_id } = req.params;
+    const days = parseInt(req.query.days) || 7;
+
+    const [results] = await db.query(
+      `SELECT date, SUM(duration_seconds) as total_duration
+       FROM daily_screen_time
+       WHERE child_id = ? AND date >= DATE_SUB(CURDATE(), INTERVAL ? DAY)
+       GROUP BY date
+       ORDER BY date ASC`,
+      [child_id, days]
+    );
+
+    res.json(results);
+  } catch (err) {
+    console.error("GET HISTORY ERROR:", err);
+    res.status(500).json({ error: "Database error", details: err.message });
+  }
+});
+
+// ===============================
+// ⏱ CHECK SCREEN TIME (total vs limit)
+// GET /api/screen-time/check/:child_id
+// Returns: { total_usage, limit, status }
+// ===============================
 router.get("/check/:child_id", async (req, res) => {
   try {
+    await ensureTable();
+
     const { child_id } = req.params;
+    const today = new Date().toISOString().slice(0, 10);
 
-    console.log("🔍 CHECK API HIT for child:", child_id);
+    // Get total usage from daily_screen_time
+    const [usageResult] = await db.query(
+      `SELECT COALESCE(SUM(duration_seconds), 0) as total_usage
+       FROM daily_screen_time
+       WHERE child_id = ? AND date = ?`,
+      [child_id, today]
+    );
+    const totalUsage = parseInt(usageResult[0].total_usage, 10) || 0;
 
-    const usageSql = `
-      SELECT SUM(duration_seconds) as total_usage
-      FROM app_usage
-      WHERE child_id = ? AND DATE(start_time) = CURDATE()
-    `;
+    // Get limit from children table (screen_time_limit is in minutes)
+    const [childResult] = await db.query(
+      `SELECT screen_time_limit FROM children WHERE id = ?`,
+      [child_id]
+    );
 
-    const [usageResult] = await db.query(usageSql, [child_id]);
-    const totalUsage = usageResult[0].total_usage || 0;
-
-    const limitSql = `
-      SELECT daily_limit_seconds
-      FROM screen_time_limits
-      WHERE child_id = ?
-    `;
-
-    const [limitResult] = await db.query(limitSql, [child_id]);
-    const limit = limitResult[0]?.daily_limit_seconds || 0;
+    // Convert minutes to seconds for comparison
+    const limitMinutes = childResult[0]?.screen_time_limit || 120;
+    const limitSeconds = limitMinutes * 60;
 
     let status = "OK";
-
-    if (limit > 0) {
-      if (totalUsage >= limit) {
+    if (limitSeconds > 0) {
+      if (totalUsage >= limitSeconds) {
         status = "BLOCK";
-      } else if (totalUsage >= limit * 0.8) {
+      } else if (totalUsage >= limitSeconds * 0.8) {
         status = "WARNING";
       }
     }
 
     res.json({
       total_usage: totalUsage,
-      limit: limit,
+      limit: limitSeconds,
+      limit_minutes: limitMinutes,
       status: status
     });
-
   } catch (err) {
-    console.error("Error checking screen time:", err);
+    console.error("CHECK SCREEN TIME ERROR:", err);
     res.status(500).json({ error: "Database error", details: err.message });
   }
 });
 
-
-// ==========================
-// SAVE USAGE (FIXED)
-// ==========================
-router.post("/save-usage", async (req, res) => {
+// ===============================
+// 🔒 SET DAILY LIMIT
+// POST /api/screen-time/set
+// ===============================
+router.post("/set", verifyToken, async (req, res) => {
   try {
-    const { child_id, usage } = req.body;
+    const { child_id, daily_limit } = req.body;
 
-    console.log("📥 Incoming usage:", req.body);
+    // daily_limit here is in minutes
+    await db.query(
+      `UPDATE children SET screen_time_limit = ? WHERE id = ?`,
+      [daily_limit, child_id]
+    );
 
-    if (!child_id || !usage || !Array.isArray(usage)) {
-      return res.status(400).json({ error: "Invalid request format" });
-    }
-
-    for (const app of usage) {
-      const appName = app.package || "unknown";
-      const time = app.time || 0;
-
-      if (time <= 0) continue;
-
-      await db.query(
-        `INSERT INTO app_usage (child_id, app_name, duration_seconds, start_time)
-         VALUES (?, ?, ?, NOW())`,
-        [child_id, appName, time]
-      );
-
-      console.log(`Inserted: ${appName} - ${time}s`);
-    }
-
-    res.json({ success: true });
-
+    res.json({ message: "Limit set successfully" });
   } catch (err) {
-    console.error("❌ Error saving usage:", err);
+    console.error("SET LIMIT ERROR:", err);
     res.status(500).json({ error: "Database error", details: err.message });
-  }
-});
-
-
-// ==========================
-// GET USAGE (PARENT DASHBOARD)
-// ==========================
-router.get("/usage/:child_id", async (req, res) => {
-  try {
-    const { child_id } = req.params;
-
-    const sql = `
-      SELECT app_name, SUM(duration_seconds) as total
-      FROM app_usage
-      WHERE child_id = ? AND DATE(start_time) = CURDATE()
-      GROUP BY app_name
-    `;
-
-    const [rows] = await db.query(sql, [child_id]);
-
-    res.json(rows);
-
-  } catch (err) {
-    console.error(" Error getting usage:", err);
-    res.status(500).json({ error: "Database error" });
   }
 });
 
