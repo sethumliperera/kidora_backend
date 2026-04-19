@@ -69,7 +69,7 @@ router.post("/send", verifyToken, async (req, res) => {
 
       console.log("📤 Emitting reminder:", payload);
 
-      io.to(room).emit("reminder", payload);
+      io.to(room).emit("new_notification", payload);
 
       await db.query(
         "UPDATE reminders SET is_sent = 1, sent_at = NOW() WHERE id = ?",
