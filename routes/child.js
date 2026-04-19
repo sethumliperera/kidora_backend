@@ -286,6 +286,63 @@ router.post("/:id/apps", async (req, res) => {
 });
 
 // ===============================
+// ⏱ GET DAILY LIMIT
+// GET /api/children/:id/limit
+// ===============================
+router.get("/:id/limit", async (req, res) => {
+  try {
+    const child_id = req.params.id;
+
+    const [rows] = await db.query(
+      "SELECT screen_time_limit FROM children WHERE id = ?",
+      [child_id]
+    );
+
+    if (rows.length === 0) {
+      return res.status(404).json({ message: "Child not found" });
+    }
+
+    const limitMinutes = rows[0].screen_time_limit || 120;
+    res.json({
+      daily_limit: limitMinutes * 60,  // Return in seconds for the background service
+      daily_limit_minutes: limitMinutes
+    });
+  } catch (err) {
+    console.error("GET LIMIT ERROR:", err);
+    res.status(500).json({ message: "Failed to get limit", error: err.message });
+  }
+});
+
+// ===============================
+// ⏱ SET DAILY LIMIT (from parent dashboard)
+// POST /api/children/:id/set-limit
+// ===============================
+router.post("/:id/set-limit", verifyToken, async (req, res) => {
+  try {
+    const child_id = req.params.id;
+    const { daily_limit } = req.body;
+
+    if (daily_limit === undefined) {
+      return res.status(400).json({ message: "daily_limit is required (in seconds)" });
+    }
+
+    // Convert seconds to minutes for storage
+    const limitMinutes = Math.round(daily_limit / 60);
+
+    await db.query(
+      "UPDATE children SET screen_time_limit = ? WHERE id = ?",
+      [limitMinutes, child_id]
+    );
+
+    res.json({ message: "Limit updated successfully", daily_limit_minutes: limitMinutes });
+  } catch (err) {
+    console.error("SET LIMIT ERROR:", err);
+    res.status(500).json({ message: "Failed to set limit", error: err.message });
+  }
+});
+
+
+// ===============================
 //  PRESENCE (FIXED)
 // ===============================
 router.post("/presence", async (req, res) => {
