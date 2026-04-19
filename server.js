@@ -53,33 +53,82 @@ const io = new Server(server, {
 app.set("io", io);
 
 // ===============================
-// SOCKET EVENTS (FIXED)
+//  SOCKET.IO SETUP
+// ===============================
+const io = new Server(server, {
+  cors: {
+    origin: "*",
+    methods: ["GET", "POST"]
+  }
+});
+
+app.set("io", io);
+
+// ===============================
+//  SOCKET EVENTS (FIXED)
 // ===============================
 io.on("connection", (socket) => {
   console.log("🟢 Socket connected:", socket.id);
 
-  // 👶 CHILD JOIN
+  // store identity inside socket (IMPORTANT FIX)
+  socket.childId = null;
+  socket.parentId = null;
+
+  // ===============================
+  // 👶 CHILD JOINS ROOM
+  // ===============================
   socket.on("join_child", (childId) => {
     if (!childId) return;
+
+    socket.childId = childId;
 
     const room = `child_${childId}`;
     socket.join(room);
 
-    console.log(`👶 Joined room: ${room}`);
+    console.log(`👶 Child joined room: ${room}`);
   });
 
-  // 👨 PARENT JOIN
+  // ===============================
+  // 👨 PARENT JOINS ROOM
+  // ===============================
   socket.on("join_parent", (parentId) => {
     if (!parentId) return;
+
+    socket.parentId = parentId;
 
     const room = `parent_${parentId}`;
     socket.join(room);
 
-    console.log(`👨 Joined room: ${room}`);
+    console.log(`👨 Parent joined room: ${room}`);
   });
 
+  // ===============================
+  // 🔔 SEND REMINDER (IMPORTANT FIX)
+  // ===============================
+  socket.on("send_reminder", (data) => {
+    try {
+      const { childId, title, message } = data;
+
+      if (!childId) return;
+
+      const room = `child_${childId}`;
+
+      io.to(room).emit("reminder", {
+        title,
+        message
+      });
+
+      console.log(`📩 Reminder sent to ${room}`);
+    } catch (err) {
+      console.log("Reminder error:", err);
+    }
+  });
+
+  // ===============================
+  // 🔴 DISCONNECT (FIX REJOIN ISSUE)
+  // ===============================
   socket.on("disconnect", () => {
-    console.log("🔴 Disconnected:", socket.id);
+    console.log("🔴 Socket disconnected:", socket.id);
   });
 });
 
