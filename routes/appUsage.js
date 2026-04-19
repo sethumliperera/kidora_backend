@@ -3,9 +3,27 @@ const router = express.Router();
 const db = require("../db");
 const verifyToken = require("../middleware/authMiddleware");
 
+// ===============================
+// 🛠 AUTO-CREATE app_usage TABLE
+// ===============================
+const ensureTable = async () => {
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS app_usage (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      child_id INT NOT NULL,
+      app_name VARCHAR(255) NOT NULL,
+      start_time DATETIME NOT NULL,
+      end_time DATETIME NOT NULL,
+      duration_seconds INT DEFAULT 0,
+      UNIQUE KEY unique_session (child_id, app_name, start_time)
+    )
+  `);
+};
+
 // ADD APP USAGE (SESSION TRACKING)
 router.post("/track", verifyToken, async (req, res) => {
   try {
+    await ensureTable();
     const { child_id, app_name, start_time, end_time, duration_seconds } = req.body;
 
     if (!child_id || !app_name || !start_time || !end_time || duration_seconds === undefined) {
