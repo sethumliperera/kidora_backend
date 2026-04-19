@@ -3,7 +3,6 @@ const router = express.Router();
 const db = require("../db");
 const verifyToken = require("../middleware/authMiddleware");
 
-
 // 🔔 CREATE NOTIFICATION
 router.post("/create", verifyToken, async (req, res) => {
   try {
@@ -18,14 +17,34 @@ router.post("/create", verifyToken, async (req, res) => {
       VALUES (?, ?, ?, ?)
     `;
 
-    await db.query(sql, [parent_id, child_id, message, type]);
+    const [result] = await db.query(sql, [
+      parent_id,
+      child_id,
+      message,
+      type,
+    ]);
+
+    // ✅ GET SOCKET INSTANCE
+    const io = req.app.get("io");
+
+    // ✅ EMIT REAL-TIME EVENT
+    io.to(`child_${child_id}`).emit("new_notification", {
+      id: result.insertId,
+      parent_id,
+      child_id,
+      message,
+      type,
+      created_at: new Date(),
+    });
+
+    console.log("📤 Notification emitted to:", `child_${child_id}`);
+
     res.json({ message: "Notification created" });
   } catch (err) {
     console.error("Error creating notification:", err);
     res.status(500).json({ error: "Database error", details: err.message });
   }
 });
-
 
 // 📥 GET NOTIFICATIONS BY CHILD
 router.get("/:child_id", verifyToken, async (req, res) => {
@@ -46,21 +65,17 @@ router.get("/:child_id", verifyToken, async (req, res) => {
   }
 });
 
-
-// 🗑️ DELETE NOTIFICATION (optional feature)
+// 🗑️ DELETE
 router.delete("/:id", verifyToken, async (req, res) => {
   try {
     const { id } = req.params;
 
-    const sql = `DELETE FROM notifications WHERE id = ?`;
-
-    await db.query(sql, [id]);
+    await db.query(`DELETE FROM notifications WHERE id = ?`, [id]);
     res.json({ message: "Notification deleted" });
   } catch (err) {
     console.error("Error deleting notification:", err);
     res.status(500).json({ error: "Database error", details: err.message });
   }
 });
-
 
 module.exports = router;
