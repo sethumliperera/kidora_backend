@@ -53,6 +53,50 @@ const io = new Server(server, {
 app.set("io", io);
 
 // ===============================
+// REMINDER SCHEDULER 🔥
+// ===============================
+setInterval(async () => {
+  try {
+    const now = new Date();
+
+    const [reminders] = await db.query(
+      `
+      SELECT * FROM reminders
+      WHERE scheduled_at <= ? AND is_sent = 0
+      `,
+      [now]
+    );
+
+    if (reminders.length > 0) {
+      console.log(`⏰ Found ${reminders.length} reminders to send`);
+    }
+
+    for (const reminder of reminders) {
+      const payload = {
+        id: reminder.id,
+        title: reminder.title,
+        message: reminder.message,
+        type: "reminder",
+        priority: reminder.priority,
+      };
+
+      // ✅ SEND TO CHILD VIA SOCKET
+      io.to(`child_${reminder.child_id}`).emit("new_notification", payload);
+
+      console.log(`📤 Sent reminder to child_${reminder.child_id}`);
+
+      // ✅ MARK AS SENT
+      await db.query(
+        `UPDATE reminders SET is_sent = 1, sent_at = NOW() WHERE id = ?`,
+        [reminder.id]
+      );
+    }
+  } catch (err) {
+    console.error("❌ Reminder scheduler error:", err);
+  }
+}, 5000); // runs every 5 seconds
+
+// ===============================
 // SOCKET HELPERS
 // ===============================
 const sendToChild = (childId, event, data) => {
