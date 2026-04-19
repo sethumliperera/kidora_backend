@@ -1,14 +1,14 @@
 require("dotenv").config({ path: "./.env" });
 
 // ===============================
-//  ENV DEBUG
+// ENV DEBUG
 // ===============================
 console.log("DB HOST:", process.env.MYSQLHOST);
 console.log("DB USER:", process.env.MYSQLUSER);
 console.log("DB NAME:", process.env.MYSQLDATABASE);
 
 // ===============================
-//  IMPORTS
+// IMPORTS
 // ===============================
 const express = require("express");
 const cors = require("cors");
@@ -16,18 +16,18 @@ const http = require("http");
 const { Server } = require("socket.io");
 
 // ===============================
-//  APP INIT
+// APP INIT
 // ===============================
 const app = express();
 const server = http.createServer(app);
 
 // ===============================
-// 🗄 DATABASE
+// DB
 // ===============================
 const db = require("./db");
 
 // ===============================
-//  MIDDLEWARE
+// MIDDLEWARE
 // ===============================
 app.use(cors({
   origin: "*",
@@ -41,17 +41,7 @@ app.use(express.urlencoded({ extended: true }));
 app.use("/uploads", express.static("uploads"));
 
 // ===============================
-//  REQUEST LOGGER
-// ===============================
-app.use((req, res, next) => {
-  res.on("finish", () => {
-    console.log(`${req.method} ${req.originalUrl} - ${res.statusCode}`);
-  });
-  next();
-});
-
-// ===============================
-//  SOCKET.IO SETUP
+// SOCKET.IO
 // ===============================
 const io = new Server(server, {
   cors: {
@@ -60,117 +50,61 @@ const io = new Server(server, {
   }
 });
 
-// 🔥 Make io available inside routes
 app.set("io", io);
 
 // ===============================
-//  SOCKET EVENTS
+// SOCKET EVENTS (FIXED)
 // ===============================
 io.on("connection", (socket) => {
   console.log("🟢 Socket connected:", socket.id);
 
-  // ===============================
-  // 👶 CHILD JOINS ROOM
-  // ===============================
+  // 👶 CHILD JOIN
   socket.on("join_child", (childId) => {
+    if (!childId) return;
+
     const room = `child_${childId}`;
     socket.join(room);
 
-    console.log(`👶 Child joined room: ${room}`);
+    console.log(`👶 Joined room: ${room}`);
   });
 
-  // ===============================
-  // 👨‍👩‍👧 PARENT JOINS ROOM (optional)
-  // ===============================
+  // 👨 PARENT JOIN
   socket.on("join_parent", (parentId) => {
+    if (!parentId) return;
+
     const room = `parent_${parentId}`;
     socket.join(room);
 
-    console.log(`👨‍👩‍👧 Parent joined room: ${room}`);
+    console.log(`👨 Joined room: ${room}`);
   });
 
-  // ===============================
-  // 🔴 DISCONNECT
-  // ===============================
   socket.on("disconnect", () => {
-    console.log("🔴 Socket disconnected:", socket.id);
+    console.log("🔴 Disconnected:", socket.id);
   });
 });
 
 // ===============================
-//  SCHEDULER (after io is ready)
-// ===============================
-const scheduler = require("./scheduler");
-scheduler.init(io);
-
-// ===============================
 // ROUTES
 // ===============================
-
-// Users
-const userRoutes = require("./routes/users");
-app.use("/api/users", userRoutes);
-
-// Children
-const childRoutes = require("./routes/child");
-app.use("/api/children", childRoutes);
-
-// App Usage
-const appUsageRoutes = require("./routes/appUsage");
-app.use("/api/app-usage", appUsageRoutes);
-
-// Screen Time
-const screenTimeRoutes = require("./routes/screenTime");
-app.use("/api/screen-time", screenTimeRoutes);
-
-// Block Apps
-const blockAppsRoutes = require("./routes/blockApps");
-app.use("/api/block-apps", blockAppsRoutes);
-
-// Notifications
-const notificationRoutes = require("./routes/notifications");
-app.use("/api/notifications", notificationRoutes);
-
-// Installed Apps
-const installedAppsRoutes = require("./routes/installedApps");
-app.use("/api/installed-apps", installedAppsRoutes);
-
-// Reminders
-const reminderRoutes = require("./routes/reminders");
-app.use("/api/reminders", reminderRoutes);
-
-// Restrictions
-const restrictionRoutes = require("./routes/restrictions");
-app.use("/api/restrictions", restrictionRoutes);
+app.use("/api/users", require("./routes/users"));
+app.use("/api/children", require("./routes/child"));
+app.use("/api/app-usage", require("./routes/appUsage"));
+app.use("/api/screen-time", require("./routes/screenTime"));
+app.use("/api/block-apps", require("./routes/blockApps"));
+app.use("/api/notifications", require("./routes/notifications"));
+app.use("/api/installed-apps", require("./routes/installedApps"));
+app.use("/api/reminders", require("./routes/reminders"));
+app.use("/api/restrictions", require("./routes/restrictions"));
 
 // ===============================
-//  TEST ROUTES
+// TEST
 // ===============================
 app.get("/", (req, res) => {
   res.json({ message: "Kidora Backend Running" });
 });
 
-app.get("/test-db", async (req, res) => {
-  try {
-    const [rows] = await db.query("SELECT 1");
-
-    res.json({
-      message: "Database connected successfully",
-      result: rows
-    });
-
-  } catch (err) {
-    console.error("DB ERROR:", err);
-
-    res.status(500).json({
-      message: "Database connection failed",
-      error: err.message
-    });
-  }
-});
-
 // ===============================
-//  START SERVER
+// START SERVER
 // ===============================
 const PORT = process.env.PORT || 3000;
 
