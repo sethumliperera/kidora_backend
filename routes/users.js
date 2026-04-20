@@ -2,6 +2,7 @@ const express = require("express");
 const router = express.Router();
 const db = require("../db");
 const crypto = require("crypto");
+const verifyToken = require("../middleware/authMiddleware");
 
 let uninstallPinColumnChecked = false;
 const ensureUninstallPinColumn = async () => {
@@ -123,6 +124,47 @@ router.delete("/:uid", async (req, res) => {
       error: "Failed to delete user and related data",
       details: err.message
     });
+  }
+});
+
+// ===============================
+// ✅ UNINSTALL PIN STATUS (AUTH)
+// ===============================
+router.get("/me/uninstall-pin-status", verifyToken, async (req, res) => {
+  try {
+    await ensureUninstallPinColumn();
+    const [rows] = await db.query(
+      "SELECT uninstall_pin_hash FROM users WHERE id = ? LIMIT 1",
+      [req.user.id]
+    );
+    if (rows.length === 0) {
+      return res.status(404).json({ message: "User not found" });
+    }
+    res.json({ has_pin: !!rows[0].uninstall_pin_hash });
+  } catch (err) {
+    console.error("UNINSTALL PIN STATUS ERROR:", err);
+    res.status(500).json({ message: "Failed to load uninstall pin status" });
+  }
+});
+
+// ===============================
+// ✅ SET/UPDATE UNINSTALL PIN (AUTH)
+// ===============================
+router.post("/me/uninstall-pin", verifyToken, async (req, res) => {
+  try {
+    await ensureUninstallPinColumn();
+    const pin = String(req.body?.pin || "").trim();
+    if (!/^\d{4}$/.test(pin)) {
+      return res.status(400).json({ message: "pin must be exactly 4 digits" });
+    }
+    await db.query(
+      "UPDATE users SET uninstall_pin_hash = ? WHERE id = ?",
+      [hashPin(pin), req.user.id]
+    );
+    res.json({ message: "Uninstall PIN saved" });
+  } catch (err) {
+    console.error("SET UNINSTALL PIN ERROR:", err);
+    res.status(500).json({ message: "Failed to save uninstall pin" });
   }
 });
 
