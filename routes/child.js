@@ -6,6 +6,25 @@ const multer = require("multer");
 const path = require("path");
 const crypto = require("crypto");
 
+let uninstallPinColumnChecked = false;
+const ensureUninstallPinColumn = async () => {
+  if (uninstallPinColumnChecked) return;
+  try {
+    await db.query(
+      "ALTER TABLE users ADD COLUMN uninstall_pin_hash VARCHAR(255) NULL"
+    );
+  } catch (err) {
+    if (!String(err.message || "").toLowerCase().includes("duplicate column")) {
+      throw err;
+    }
+  } finally {
+    uninstallPinColumnChecked = true;
+  }
+};
+
+const hashPin = (pin) =>
+  crypto.createHash("sha256").update(String(pin)).digest("hex");
+
 // ===============================
 //  MULTER CONFIG
 // ===============================
@@ -455,6 +474,60 @@ router.post("/save-fcm-token", async (req, res) => {
   } catch (err) {
     console.error("SAVE FCM TOKEN ERROR:", err);
     res.status(500).json({ message: "Failed to save FCM token", error: err.message });
+  }
+});
+
+// ===============================
+//  VERIFY UNINSTALL PIN (CHILD SIDE)
+// ===============================
+router.post("/verify-uninstall-pin", async (req, res) => {
+  try {
+    await ensureUninstallPinColumn();
+    const { child_id, child_public_id, pin } = req.body;
+
+    if (!/^\d{4}$/.test(String(pin || "").trim())) {
+      return res.status(400).json({ message: "pin must be exactly 4 digits" });
+    }
+
+    let childRows = [];
+    if (child_id !== undefined && child_id !== null && String(child_id).trim() !== "") {
+      const [rowsById] = await db.query(
+        "SELECT id, parent_id FROM children WHERE id = ? LIMIT 1",
+        [child_id]
+      );
+      childRows = rowsById;
+    } else if (
+      child_public_id !== undefined &&
+      child_public_id !== null &&
+      String(child_public_id).trim() !== ""
+    ) {
+      const [rowsByPublicId] = await db.query(
+        "SELECT id, parent_id FROM children WHERE child_id = ? LIMIT 1",
+        [String(child_public_id).trim()]
+      );
+      childRows = rowsByPublicId;
+    } else {
+      return res.status(400).json({ message: "child_id or child_public_id is required" });
+    }
+
+    if (childRows.length === 0) {
+      return res.status(404).json({ message: "Child not found" });
+    }
+
+    const parentId = childRows[0].parent_id;
+    const [userRows] = await db.query(
+      "SELECT uninstall_pin_hash FROM users WHERE id = ? LIMIT 1",
+      [parentId]
+    );
+    if (userRows.length === 0 || !userRows[0].uninstall_pin_hash) {
+      return res.status(404).json({ message: "Parent uninstall PIN is not set" });
+    }
+
+    const valid = userRows[0].uninstall_pin_hash === hashPin(String(pin).trim());
+    return res.json({ valid });
+  } catch (err) {
+    console.error("VERIFY UNINSTALL PIN ERROR:", err);
+    res.status(500).json({ message: "Failed to verify uninstall PIN", error: err.message });
   }
 });
 // ===============================
