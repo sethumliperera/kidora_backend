@@ -1,6 +1,27 @@
 const express = require("express");
 const router = express.Router();
 const db = require("../db");
+const crypto = require("crypto");
+
+let uninstallPinColumnChecked = false;
+const ensureUninstallPinColumn = async () => {
+  if (uninstallPinColumnChecked) return;
+  try {
+    await db.query(
+      "ALTER TABLE users ADD COLUMN uninstall_pin_hash VARCHAR(255) NULL"
+    );
+    console.log("✅ Added users.uninstall_pin_hash column");
+  } catch (err) {
+    if (!String(err.message || "").toLowerCase().includes("duplicate column")) {
+      throw err;
+    }
+  } finally {
+    uninstallPinColumnChecked = true;
+  }
+};
+
+const hashPin = (pin) =>
+  crypto.createHash("sha256").update(String(pin)).digest("hex");
 
 
 // ===============================
@@ -11,21 +32,35 @@ const db = require("../db");
 // ===============================
 router.post("/", async (req, res) => {
   try {
-    const { uid, email } = req.body;
+    await ensureUninstallPinColumn();
+    const { uid, email, uninstall_pin } = req.body;
 
     if (!uid || !email) {
       return res.status(400).json({ error: "Missing uid or email" });
     }
 
+    if (
+      uninstall_pin !== undefined &&
+      !/^\d{4}$/.test(String(uninstall_pin).trim())
+    ) {
+      return res.status(400).json({ error: "uninstall_pin must be exactly 4 digits" });
+    }
+
     console.log("Saving user:", uid, email);
 
+    const uninstallPinHash =
+      uninstall_pin !== undefined ? hashPin(String(uninstall_pin).trim()) : null;
+
     const sql = `
-      INSERT INTO users (firebase_uid, email)
-      VALUES (?, ?)
-      ON DUPLICATE KEY UPDATE email = VALUES(email), firebase_uid = VALUES(firebase_uid)
+      INSERT INTO users (firebase_uid, email, uninstall_pin_hash)
+      VALUES (?, ?, ?)
+      ON DUPLICATE KEY UPDATE
+        email = VALUES(email),
+        firebase_uid = VALUES(firebase_uid),
+        uninstall_pin_hash = COALESCE(VALUES(uninstall_pin_hash), uninstall_pin_hash)
     `;
 
-    await db.query(sql, [uid, email]);
+    await db.query(sql, [uid, email, uninstallPinHash]);
 
     console.log("User saved successfully in DB");
     res.status(200).json({
