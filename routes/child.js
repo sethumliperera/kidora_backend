@@ -422,14 +422,40 @@ router.post("/:id/reminders", async (req, res) => {
 //  FCM TOKEN
 // ===============================
 router.post("/save-fcm-token", async (req, res) => {
-  const { child_id, fcm_token } = req.body;
+  try {
+    const { child_id, child_public_id, fcm_token } = req.body;
+    if (!fcm_token || String(fcm_token).trim() === "") {
+      return res.status(400).json({ message: "fcm_token is required" });
+    }
 
-  await db.query(
-    "UPDATE children SET fcm_token = ? WHERE id = ?",
-    [fcm_token, child_id]
-  );
+    let result;
+    if (child_id !== undefined && child_id !== null && String(child_id).trim() !== "") {
+      [result] = await db.query(
+        "UPDATE children SET fcm_token = ? WHERE id = ?",
+        [fcm_token, child_id]
+      );
+    } else if (
+      child_public_id !== undefined &&
+      child_public_id !== null &&
+      String(child_public_id).trim() !== ""
+    ) {
+      [result] = await db.query(
+        "UPDATE children SET fcm_token = ? WHERE child_id = ?",
+        [fcm_token, String(child_public_id).trim()]
+      );
+    } else {
+      return res.status(400).json({ message: "child_id or child_public_id is required" });
+    }
 
-  res.json({ message: "Saved" });
+    if (!result || result.affectedRows === 0) {
+      return res.status(404).json({ message: "Child not found for token save" });
+    }
+
+    res.json({ message: "Saved" });
+  } catch (err) {
+    console.error("SAVE FCM TOKEN ERROR:", err);
+    res.status(500).json({ message: "Failed to save FCM token", error: err.message });
+  }
 });
 // ===============================
 // 📅 APP RESTRICTION SCHEDULES
