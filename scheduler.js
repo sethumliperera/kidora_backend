@@ -94,13 +94,15 @@ const scheduleReminder = (reminder) => {
  */
 const emitReminder = (room, data) => {
   if (ioInstance) {
-    ioInstance.to(room).emit("reminder", {
+    const payload = {
       title: data.priority === "urgent" ? `🚨 Urgent: ${data.title}` : `📢 ${data.title}`,
       message: data.message,
       reminder_id: data.id,
       priority: data.priority || "normal",
       time: new Date().toISOString()
-    });
+    };
+    ioInstance.to(room).emit("new_notification", payload);
+    ioInstance.to(room).emit("reminder", payload);
     console.log(`✅ [Scheduler] Socket emitted to ${room}`);
   } else {
     console.warn("⚠️ [Scheduler] Cannot emit: Socket.io instance not set");
