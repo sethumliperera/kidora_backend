@@ -75,9 +75,11 @@ function parseLocalDate(body, query) {
 }
 
 // ===============================
-// 💾 SAVE USAGE (from child background service)
+// 💾 SAVE USAGE (child app: foreground + background service)
 // POST /api/screen-time/save-usage
-// Body: { child_id, total_screen_time, usage: [{ app_name, duration }] }
+// Body: { child_id, local_date?, total_screen_time, usage: [{ app_name, duration }] }
+// Writes: daily_screen_time (per app per day), daily_screen_time_totals (per child per day),
+//         app_usage (daily rollup row per app), children.rt_day / rt_today_seconds when columns exist
 // ===============================
 router.post("/save-usage", async (req, res) => {
   try {
@@ -301,7 +303,7 @@ router.get("/check/:child_id", async (req, res) => {
 });
 
 // ===============================
-// SET DAILY LIMIT
+// 🔒 SET DAILY LIMIT
 // POST /api/screen-time/set
 // ===============================
 router.post("/set", verifyToken, async (req, res) => {
