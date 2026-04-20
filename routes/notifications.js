@@ -24,20 +24,26 @@ router.post("/create", verifyToken, async (req, res) => {
       type,
     ]);
 
-    // ✅ GET SOCKET INSTANCE
+    // ✅ GET SOCKET HELPERS
     const io = req.app.get("io");
-
-    // ✅ EMIT REAL-TIME EVENT
-    io.to(`child_${child_id}`).emit("new_notification", {
+    const sendToChild = req.app.get("sendToChild");
+    const payload = {
       id: result.insertId,
       parent_id,
       child_id,
       message,
       type,
       created_at: new Date(),
-    });
+    };
 
-    console.log("📤 Notification emitted to:", `child_${child_id}`);
+    // ✅ EMIT REAL-TIME EVENT
+    if (typeof sendToChild === "function") {
+      await sendToChild(child_id, "new_notification", payload);
+    } else {
+      io.to(`child_${child_id}`).emit("new_notification", payload);
+    }
+
+    console.log("📤 Notification emitted to child ref:", child_id);
 
     res.json({ message: "Notification created" });
   } catch (err) {
