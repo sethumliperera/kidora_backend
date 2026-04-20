@@ -6,10 +6,20 @@ const verifyToken = require("../middleware/authMiddleware");
 // 🔔 CREATE NOTIFICATION
 router.post("/create", verifyToken, async (req, res) => {
   try {
-    const { parent_id, child_id, message, type } = req.body;
+    const parent_id = req.user.id;
+    const { child_id, message, type } = req.body;
 
-    if (!parent_id || !child_id || !message || !type) {
+    if (!child_id || !message || !type) {
       return res.status(400).json({ message: "All fields are required" });
+    }
+
+    // Ensure the parent can only create notifications for owned children.
+    const [ownedRows] = await db.query(
+      "SELECT id FROM children WHERE id = ? AND parent_id = ? LIMIT 1",
+      [child_id, parent_id]
+    );
+    if (!ownedRows.length) {
+      return res.status(403).json({ message: "Unauthorized" });
     }
 
     const sql = `
@@ -55,15 +65,24 @@ router.post("/create", verifyToken, async (req, res) => {
 // 📥 GET NOTIFICATIONS BY CHILD
 router.get("/:child_id", verifyToken, async (req, res) => {
   try {
+    const parent_id = req.user.id;
     const { child_id } = req.params;
+
+    const [ownedRows] = await db.query(
+      "SELECT id FROM children WHERE id = ? AND parent_id = ? LIMIT 1",
+      [child_id, parent_id]
+    );
+    if (!ownedRows.length) {
+      return res.status(403).json({ message: "Unauthorized" });
+    }
 
     const sql = `
       SELECT * FROM notifications
-      WHERE child_id = ?
+      WHERE child_id = ? AND parent_id = ?
       ORDER BY created_at DESC
     `;
 
-    const [results] = await db.query(sql, [child_id]);
+    const [results] = await db.query(sql, [child_id, parent_id]);
     res.json(results);
   } catch (err) {
     console.error("Error fetching notifications:", err);
@@ -74,7 +93,19 @@ router.get("/:child_id", verifyToken, async (req, res) => {
 // 🗑️ DELETE
 router.delete("/:id", verifyToken, async (req, res) => {
   try {
+    const parent_id = req.user.id;
     const { id } = req.params;
+
+    const [rows] = await db.query(
+      "SELECT parent_id FROM notifications WHERE id = ? LIMIT 1",
+      [id]
+    );
+    if (!rows.length) {
+      return res.status(404).json({ message: "Notification not found" });
+    }
+    if (Number(rows[0].parent_id) !== Number(parent_id)) {
+      return res.status(403).json({ message: "Unauthorized" });
+    }
 
     await db.query(`DELETE FROM notifications WHERE id = ?`, [id]);
     res.json({ message: "Notification deleted" });
