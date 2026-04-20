@@ -84,24 +84,8 @@ router.post("/send", verifyToken, async (req, res) => {
       console.log("⏳ Not emitted (scheduled or io missing)");
     }
 
-    // 4. OPTIONAL SCHEDULER
-    try {
-      const scheduler = require("../scheduler");
-
-      if (frequency !== "once" || !isImmediate) {
-        scheduler.scheduleReminder({
-          id: reminder_id,
-          child_id,
-          title,
-          message,
-          priority,
-          scheduled_at,
-          frequency
-        });
-      }
-    } catch (err) {
-      console.log("⚠ Scheduler not active:", err.message);
-    }
+    // 4. Scheduling is handled centrally in server.js (is_sent poller).
+    // Do not schedule here to avoid duplicate/competing schedulers.
 
     return res.json({
       message: isImmediate ? "Reminder sent" : "Reminder scheduled",
