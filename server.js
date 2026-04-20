@@ -98,14 +98,11 @@ const resolveChildRooms = async (childRef) => {
 // ===============================
 setInterval(async () => {
   try {
-    const now = new Date();
-
     const [reminders] = await db.query(
       `
       SELECT * FROM reminders
-      WHERE scheduled_at <= ? AND is_sent = 0
-      `,
-      [now]
+      WHERE scheduled_at <= NOW() AND is_sent = 0
+      `
     );
 
     if (reminders.length > 0) {
