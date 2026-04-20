@@ -52,6 +52,47 @@ const io = new Server(server, {
 
 app.set("io", io);
 
+const isNumericChildRef = (value) =>
+  typeof value === "number" || /^\d+$/.test(String(value || "").trim());
+
+const resolveChildRooms = async (childRef) => {
+  const rooms = new Set();
+  if (childRef === undefined || childRef === null || childRef === "") {
+    return [];
+  }
+
+  const refString = String(childRef).trim();
+  rooms.add(`child_${refString}`);
+
+  try {
+    let rows = [];
+    if (isNumericChildRef(refString)) {
+      const [byId] = await db.query(
+        "SELECT id, child_id FROM children WHERE id = ? LIMIT 1",
+        [Number(refString)]
+      );
+      rows = byId;
+    } else {
+      const [byPublicId] = await db.query(
+        "SELECT id, child_id FROM children WHERE child_id = ? LIMIT 1",
+        [refString]
+      );
+      rows = byPublicId;
+    }
+
+    if (rows.length > 0) {
+      rooms.add(`child_${rows[0].id}`);
+      if (rows[0].child_id) {
+        rooms.add(`child_${rows[0].child_id}`);
+      }
+    }
+  } catch (err) {
+    console.error("⚠ Failed to resolve child rooms:", err.message);
+  }
+
+  return [...rooms];
+};
+
 // ===============================
 // REMINDER SCHEDULER 🔥
 // ===============================
@@ -81,7 +122,8 @@ setInterval(async () => {
       };
 
       // ✅ SEND TO CHILD VIA SOCKET
-      io.to(`child_${reminder.child_id}`).emit("new_notification", payload);
+      const rooms = await resolveChildRooms(reminder.child_id);
+      rooms.forEach((room) => io.to(room).emit("new_notification", payload));
 
       console.log(`📤 Sent reminder to child_${reminder.child_id}`);
 
@@ -99,8 +141,9 @@ setInterval(async () => {
 // ===============================
 // SOCKET HELPERS
 // ===============================
-const sendToChild = (childId, event, data) => {
-  io.to(`child_${childId}`).emit(event, data);
+const sendToChild = async (childId, event, data) => {
+  const rooms = await resolveChildRooms(childId);
+  rooms.forEach((room) => io.to(room).emit(event, data));
 };
 
 const sendToParent = (parentId, event, data) => {
@@ -113,10 +156,11 @@ const sendToParent = (parentId, event, data) => {
 io.on("connection", (socket) => {
   console.log("🟢 Socket connected:", socket.id);
 
-  socket.on("join_child", (childId) => {
+  socket.on("join_child", async (childId) => {
     if (!childId) return;
-    socket.join(`child_${childId}`);
-    console.log(`👶 Joined child room: child_${childId}`);
+    const rooms = await resolveChildRooms(childId);
+    rooms.forEach((room) => socket.join(room));
+    console.log(`👶 Joined child rooms for ${childId}: ${rooms.join(", ")}`);
   });
 
   socket.on("join_parent", (parentId) => {
