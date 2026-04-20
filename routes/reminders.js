@@ -51,9 +51,14 @@ router.post("/send", verifyToken, async (req, res) => {
     const io = req.app.get("io");
     const sendToChild = req.app.get("sendToChild");
 
-    const isImmediate =
-      !scheduled_at ||
-      new Date(scheduled_at).getTime() <= Date.now() + 5000;
+    let isImmediate = !scheduled_at;
+    if (scheduled_at) {
+      const [dueCheck] = await db.query(
+        "SELECT (? <= NOW()) AS is_due",
+        [scheduled_at]
+      );
+      isImmediate = Boolean(dueCheck?.[0]?.is_due);
+    }
 
     console.log("📡 Target child ref:", child_id);
 
