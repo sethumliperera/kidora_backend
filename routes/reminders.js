@@ -214,7 +214,7 @@ router.delete("/:id", verifyToken, async (req, res) => {
 
     if (!rows.length) return res.status(404).json({ message: "Not found" });
 
-    if (rows[0].parent_id !== parent_id) {
+    if (Number(rows[0].parent_id) !== Number(parent_id)) {
       return res.status(403).json({ message: "Unauthorized" });
     }
 
