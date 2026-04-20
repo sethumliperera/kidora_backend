@@ -14,6 +14,7 @@ const express = require("express");
 const cors = require("cors");
 const http = require("http");
 const { Server } = require("socket.io");
+const admin = require("./firebaseAdmin");
 
 // ===============================
 // APP INIT
@@ -121,6 +122,60 @@ setInterval(async () => {
       // ✅ SEND TO CHILD VIA SOCKET
       const rooms = await resolveChildRooms(reminder.child_id);
       rooms.forEach((room) => io.to(room).emit("new_notification", payload));
+
+      // ✅ SEND TO CHILD VIA FCM (works when app is backgrounded/closed)
+      const [childRows] = await db.query(
+        "SELECT fcm_token FROM children WHERE id = ? LIMIT 1",
+        [reminder.child_id]
+      );
+      const fcmToken = childRows?.[0]?.fcm_token;
+      if (fcmToken) {
+        try {
+          await admin.messaging().send({
+            token: fcmToken,
+            notification: {
+              title: reminder.title || "Reminder",
+              body: reminder.message || "You have a new reminder.",
+            },
+            data: {
+              type: "reminder",
+              reminder_id: String(reminder.id),
+              priority: String(reminder.priority || "normal"),
+              title: String(reminder.title || "Reminder"),
+              message: String(reminder.message || "You have a new reminder."),
+            },
+            android: {
+              priority: "high",
+              notification: {
+                channelId: "kidora_channel",
+                sound: "default",
+              },
+            },
+            apns: {
+              payload: {
+                aps: {
+                  sound: "default",
+                },
+              },
+            },
+          });
+        } catch (pushErr) {
+          console.error(
+            `❌ FCM send failed for child ${reminder.child_id}:`,
+            pushErr.message
+          );
+
+          const code = pushErr?.errorInfo?.code || pushErr?.code || "";
+          if (
+            code.includes("registration-token-not-registered") ||
+            code.includes("invalid-registration-token")
+          ) {
+            await db.query("UPDATE children SET fcm_token = NULL WHERE id = ?", [
+              reminder.child_id,
+            ]);
+          }
+        }
+      }
 
       console.log(`📤 Sent reminder to child_${reminder.child_id}`);
 
