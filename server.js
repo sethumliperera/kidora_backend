@@ -129,9 +129,10 @@ setInterval(async () => {
         [reminder.child_id]
       );
       const fcmToken = childRows?.[0]?.fcm_token;
+      let fcmDelivered = false;
       if (fcmToken) {
         try {
-          await admin.messaging().send({
+          const messageId = await admin.messaging().send({
             token: fcmToken,
             notification: {
               title: reminder.title || "Reminder",
@@ -159,6 +160,10 @@ setInterval(async () => {
               },
             },
           });
+          fcmDelivered = true;
+          console.log(
+            `✅ FCM sent for reminder ${reminder.id} to child ${reminder.child_id}: ${messageId}`
+          );
         } catch (pushErr) {
           console.error(
             `❌ FCM send failed for child ${reminder.child_id}:`,
@@ -177,7 +182,17 @@ setInterval(async () => {
         }
       }
 
-      console.log(`📤 Sent reminder to child_${reminder.child_id}`);
+      // If a token exists but FCM failed, keep reminder pending for retry.
+      if (fcmToken && !fcmDelivered) {
+        console.log(
+          `⏳ Skipping mark-as-sent for reminder ${reminder.id}; will retry FCM`
+        );
+        continue;
+      }
+
+      console.log(
+        `📤 Sent reminder to child_${reminder.child_id} (socket${fcmToken ? " + fcm" : " only"})`
+      );
 
       // ✅ MARK AS SENT
       await db.query(
