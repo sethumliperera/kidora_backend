@@ -51,14 +51,11 @@ router.post("/send", verifyToken, async (req, res) => {
     const io = req.app.get("io");
     const sendToChild = req.app.get("sendToChild");
 
-    let isImmediate = !scheduled_at;
-    if (scheduled_at) {
-      const [dueCheck] = await db.query(
-        "SELECT (? <= NOW()) AS is_due",
-        [scheduled_at]
-      );
-      isImmediate = Boolean(dueCheck?.[0]?.is_due);
+    const parsedScheduledAt = scheduled_at ? new Date(scheduled_at) : null;
+    if (scheduled_at && Number.isNaN(parsedScheduledAt?.getTime())) {
+      return res.status(400).json({ message: "Invalid scheduled_at timestamp" });
     }
+    const isImmediate = !parsedScheduledAt || parsedScheduledAt.getTime() <= Date.now();
 
     console.log("📡 Target child ref:", child_id);
 
