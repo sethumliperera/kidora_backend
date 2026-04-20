@@ -47,6 +47,21 @@ const ensureInstalledAppsTable = async () => {
   `);
 };
 
+// One row per child + app + calendar day (start_time = local midnight) for history + dashboards
+const ensureAppUsageTable = async () => {
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS app_usage (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      child_id INT NOT NULL,
+      app_name VARCHAR(255) NOT NULL,
+      start_time DATETIME NOT NULL,
+      end_time DATETIME NOT NULL,
+      duration_seconds INT NOT NULL DEFAULT 0,
+      UNIQUE KEY unique_child_app_day_start (child_id, app_name, start_time)
+    )
+  `);
+};
+
 function parseLocalDate(body, query) {
   const q = query && query.date;
   const raw =
@@ -68,6 +83,7 @@ router.post("/save-usage", async (req, res) => {
   try {
     await ensureTable();
     await ensureTotalsTable();
+    await ensureAppUsageTable();
 
     const { child_id, total_screen_time, usage } = req.body;
 
@@ -77,17 +93,33 @@ router.post("/save-usage", async (req, res) => {
 
     // Device-local calendar day (must match Android midnight); falls back to UTC date.
     const day = parseLocalDate(req.body, req.query);
+    const dayStart = `${day} 00:00:00`;
 
     // Upsert each app's usage for this local day (app_name = package name from the device)
     for (const app of usage) {
       if (!app.app_name || app.duration === undefined) continue;
+      const duration = Math.max(0, parseInt(app.duration) || 0);
 
       await db.query(
         `INSERT INTO daily_screen_time (child_id, app_name, date, duration_seconds)
          VALUES (?, ?, ?, ?)
          ON DUPLICATE KEY UPDATE duration_seconds = VALUES(duration_seconds)`,
-        [child_id, app.app_name, day, Math.max(0, parseInt(app.duration) || 0)]
+        [child_id, app.app_name, day, duration]
       );
+
+      // Daily rollup in app_usage (same local day = same start_time → upsert)
+      try {
+        await db.query(
+          `INSERT INTO app_usage (child_id, app_name, start_time, end_time, duration_seconds)
+           VALUES (?, ?, ?, NOW(), ?)
+           ON DUPLICATE KEY UPDATE
+             end_time = NOW(),
+             duration_seconds = VALUES(duration_seconds)`,
+          [child_id, app.app_name, dayStart, duration]
+        );
+      } catch (e) {
+        console.warn("Could not log to app_usage:", e.message);
+      }
     }
 
     const totalSecs = Math.max(0, parseInt(total_screen_time, 10) || 0);
@@ -269,7 +301,7 @@ router.get("/check/:child_id", async (req, res) => {
 });
 
 // ===============================
-// 🔒 SET DAILY LIMIT
+// SET DAILY LIMIT
 // POST /api/screen-time/set
 // ===============================
 router.post("/set", verifyToken, async (req, res) => {
