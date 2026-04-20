@@ -87,26 +87,35 @@ router.post("/save-usage", async (req, res) => {
     await ensureTotalsTable();
     await ensureAppUsageTable();
 
-    const { child_id, total_screen_time, usage } = req.body;
+    const { total_screen_time, usage } = req.body;
+    const cid = parseInt(String(req.body.child_id), 10);
+    const usageList = Array.isArray(usage) ? usage : [];
 
-    if (!child_id || !usage || !Array.isArray(usage)) {
-      return res.status(400).json({ error: "child_id and usage[] are required" });
+    if (!Number.isFinite(cid) || cid <= 0) {
+      return res.status(400).json({ error: "valid child_id is required" });
     }
 
     // Device-local calendar day (must match Android midnight); falls back to UTC date.
     const day = parseLocalDate(req.body, req.query);
     const dayStart = `${day} 00:00:00`;
 
+    console.log("[save-usage] incoming", {
+      child_id: cid,
+      day,
+      apps: usageList.length,
+      total: total_screen_time
+    });
+
     // Upsert each app's usage for this local day (app_name = package name from the device)
-    for (const app of usage) {
-      if (!app.app_name || app.duration === undefined) continue;
-      const duration = Math.max(0, parseInt(app.duration) || 0);
+    for (const app of usageList) {
+      if (!app || !app.app_name || app.duration === undefined) continue;
+      const duration = Math.max(0, parseInt(app.duration, 10) || 0);
 
       await db.query(
         `INSERT INTO daily_screen_time (child_id, app_name, date, duration_seconds)
          VALUES (?, ?, ?, ?)
          ON DUPLICATE KEY UPDATE duration_seconds = VALUES(duration_seconds)`,
-        [child_id, app.app_name, day, duration]
+        [cid, app.app_name, day, duration]
       );
 
       // Daily rollup in app_usage (same local day = same start_time → upsert)
@@ -117,7 +126,7 @@ router.post("/save-usage", async (req, res) => {
            ON DUPLICATE KEY UPDATE
              end_time = NOW(),
              duration_seconds = VALUES(duration_seconds)`,
-          [child_id, app.app_name, dayStart, duration]
+          [cid, app.app_name, dayStart, duration]
         );
       } catch (e) {
         console.warn("Could not log to app_usage:", e.message);
@@ -129,20 +138,21 @@ router.post("/save-usage", async (req, res) => {
       `INSERT INTO daily_screen_time_totals (child_id, date, total_seconds)
        VALUES (?, ?, ?)
        ON DUPLICATE KEY UPDATE total_seconds = VALUES(total_seconds), updated_at = CURRENT_TIMESTAMP`,
-      [child_id, day, totalSecs]
+      [cid, day, totalSecs]
     );
 
     // Also update the children table for live presence polling (only when this payload is "today" on the device)
     try {
       await db.query(
         `UPDATE children SET rt_day = ?, rt_today_seconds = ? WHERE id = ?`,
-        [day, totalSecs, child_id]
+        [day, totalSecs, cid]
       );
     } catch (e) {
       // Columns might not exist yet — ignore
       console.warn("Could not update rt_ columns:", e.message);
     }
 
+    console.log("[save-usage] ok", { child_id: cid, day, appsWritten: usageList.length, total: totalSecs });
     res.json({ message: "Usage saved successfully", date: day });
   } catch (err) {
     console.error("SAVE USAGE ERROR:", err);
@@ -160,16 +170,22 @@ router.get("/usage/:child_id", async (req, res) => {
     await ensureTable();
     await ensureTotalsTable();
     await ensureInstalledAppsTable();
+    await ensureAppUsageTable();
 
-    const { child_id } = req.params;
+    const cid = parseInt(String(req.params.child_id), 10);
+    if (!Number.isFinite(cid) || cid <= 0) {
+      return res.status(400).json({ error: "invalid child_id" });
+    }
+
     const date = req.query.date || new Date().toISOString().slice(0, 10);
+    const dayStart = `${date} 00:00:00`;
 
     const [totRows] = await db.query(
       `SELECT total_seconds FROM daily_screen_time_totals WHERE child_id = ? AND date = ?`,
-      [child_id, date]
+      [cid, date]
     );
 
-    const [results] = await db.query(
+    let [results] = await db.query(
       `SELECT d.app_name AS package_name,
               COALESCE(i.app_name, d.app_name) AS app_name,
               d.duration_seconds AS duration
@@ -178,8 +194,30 @@ router.get("/usage/:child_id", async (req, res) => {
          ON i.child_id = d.child_id AND i.package_name = d.app_name
        WHERE d.child_id = ? AND d.date = ?
        ORDER BY d.duration_seconds DESC`,
-      [child_id, date]
+      [cid, date]
     );
+
+    // If daily_screen_time has no rows (older data or partial writes), read daily rollup from app_usage.
+    if (results.length === 0) {
+      try {
+        const [fromUsage] = await db.query(
+          `SELECT a.app_name AS package_name,
+                  COALESCE(i.app_name, a.app_name) AS app_name,
+                  a.duration_seconds AS duration
+           FROM app_usage a
+           LEFT JOIN installed_apps i
+             ON i.child_id = a.child_id AND i.package_name = a.app_name
+           WHERE a.child_id = ? AND (DATE(a.start_time) = ? OR a.start_time = ?)
+           ORDER BY a.duration_seconds DESC`,
+          [cid, date, dayStart]
+        );
+        if (fromUsage.length > 0) {
+          results = fromUsage;
+        }
+      } catch (e) {
+        console.warn("GET usage app_usage fallback:", e.message);
+      }
+    }
 
     let sumApps = 0;
     const apps = results.map((row) => {
