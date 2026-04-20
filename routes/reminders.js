@@ -49,14 +49,13 @@ router.post("/send", verifyToken, async (req, res) => {
 
     // 3. SOCKET EMIT
     const io = req.app.get("io");
+    const sendToChild = req.app.get("sendToChild");
 
     const isImmediate =
       !scheduled_at ||
       new Date(scheduled_at).getTime() <= Date.now() + 5000;
 
-    const room = `child_${child_id}`;
-
-    console.log("📡 Target room:", room);
+    console.log("📡 Target child ref:", child_id);
 
     if (io && isImmediate) {
       const payload = {
@@ -69,7 +68,11 @@ router.post("/send", verifyToken, async (req, res) => {
 
       console.log("📤 Emitting reminder:", payload);
 
-      io.to(room).emit("new_notification", payload);
+      if (typeof sendToChild === "function") {
+        await sendToChild(child_id, "new_notification", payload);
+      } else {
+        io.to(`child_${child_id}`).emit("new_notification", payload);
+      }
 
       await db.query(
         "UPDATE reminders SET is_sent = 1, sent_at = NOW() WHERE id = ?",
