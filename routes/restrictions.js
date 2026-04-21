@@ -292,6 +292,7 @@ router.get("/active/:child_id", async (req, res) => {
 
         const days = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"];
         const today = days[now.getDay()];
+        const yesterday = days[(now.getDay() + 6) % 7];
 
         const [rows] = await db.query(
             "SELECT * FROM restrictions WHERE child_id = ? AND enabled = 1",
@@ -305,15 +306,18 @@ router.get("/active/:child_id", async (req, res) => {
             const end = parseTime(r.end_time);
 
             const restrictionDays = JSON.parse(r.days || "[]");
-            if (!restrictionDays.includes(today)) return false;
-
             // Normal same-day window (e.g. 14:00 -> 18:00)
             if (start <= end) {
+                if (!restrictionDays.includes(today)) return false;
                 return currentMinutes >= start && currentMinutes <= end;
             }
 
             // Overnight window (e.g. 22:00 -> 06:00)
-            return currentMinutes >= start || currentMinutes <= end;
+            const inLateWindow =
+                restrictionDays.includes(today) && currentMinutes >= start;
+            const inEarlyWindow =
+                restrictionDays.includes(yesterday) && currentMinutes <= end;
+            return inLateWindow || inEarlyWindow;
         });
 
         res.json(activeRestrictions);
