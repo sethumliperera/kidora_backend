@@ -55,7 +55,7 @@ router.post("/", verifyToken, async (req, res) => {
         const [result] = await db.query(
             `INSERT INTO ${TABLE}
             (child_id, name, start_time, end_time, days, blocked_apps, is_enabled)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+            VALUES (?, ?, ?, ?, ?, ?, ?)`,
             [
                 child_id,
                 type,
