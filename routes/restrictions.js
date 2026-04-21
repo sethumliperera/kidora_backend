@@ -305,12 +305,15 @@ router.get("/active/:child_id", async (req, res) => {
             const end = parseTime(r.end_time);
 
             const restrictionDays = JSON.parse(r.days || "[]");
+            if (!restrictionDays.includes(today)) return false;
 
-            return (
-                restrictionDays.includes(today) &&
-                currentMinutes >= start &&
-                currentMinutes <= end
-            );
+            // Normal same-day window (e.g. 14:00 -> 18:00)
+            if (start <= end) {
+                return currentMinutes >= start && currentMinutes <= end;
+            }
+
+            // Overnight window (e.g. 22:00 -> 06:00)
+            return currentMinutes >= start || currentMinutes <= end;
         });
 
         res.json(activeRestrictions);
