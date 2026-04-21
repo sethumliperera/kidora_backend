@@ -159,6 +159,42 @@ function buildFlaggedSearchEmailHtml({
 
 let transporter = null;
 
+/** Render / hosts often use different names — we accept these for Kidora Gmail. */
+const SMTP_USER_ENV_KEYS = [
+  "SMTP_USER",
+  "GMAIL_USER",
+  "GMAIL_ADDRESS",
+  "EMAIL_USER",
+  "MAIL_USERNAME",
+  "MAIL_USER",
+];
+const SMTP_PASS_ENV_KEYS = [
+  "SMTP_PASS",
+  "SMTP_PASSWORD",
+  "GMAIL_APP_PASSWORD",
+  "GMAIL_PASSWORD",
+  "EMAIL_PASSWORD",
+  "MAIL_PASSWORD",
+];
+
+function pickFirstEnv(keys) {
+  for (const k of keys) {
+    const raw = process.env[k];
+    if (raw == null) continue;
+    const v = String(raw).trim();
+    if (v !== "") return { key: k, value: v };
+  }
+  return { key: null, value: "" };
+}
+
+function resolveSmtpUser() {
+  return pickFirstEnv(SMTP_USER_ENV_KEYS).value;
+}
+
+function resolveSmtpPass() {
+  return pickFirstEnv(SMTP_PASS_ENV_KEYS).value;
+}
+
 function isLikelyGmailAccount(userRaw) {
   const u = String(userRaw || "")
     .trim()
@@ -175,7 +211,7 @@ function shouldUseGmailServiceTransport() {
   const svc = (process.env.SMTP_SERVICE || "").toLowerCase().trim();
   const hostRaw = (process.env.SMTP_HOST || "").trim();
   const host = hostRaw.toLowerCase();
-  const user = process.env.SMTP_USER?.trim();
+  const user = resolveSmtpUser();
 
   if (provider === "gmail" || svc === "gmail" || host === "smtp.gmail.com") return true;
   if (isLikelyGmailAccount(user) && !hostRaw) return true;
@@ -184,10 +220,12 @@ function shouldUseGmailServiceTransport() {
 
 function getTransporter() {
   if (transporter) return transporter;
-  const user = process.env.SMTP_USER?.trim();
-  const pass = process.env.SMTP_PASS;
+  const user = resolveSmtpUser();
+  const pass = resolveSmtpPass();
   if (!user || !pass) {
-    console.warn("[safety] SMTP_USER or SMTP_PASS missing — cannot send email");
+    console.warn(
+      "[safety] No SMTP credentials — set SMTP_USER + SMTP_PASS on the host (or GMAIL_USER + GMAIL_APP_PASSWORD)."
+    );
     return null;
   }
   const auth = { user, pass };
@@ -264,7 +302,7 @@ async function sendViaSendGrid(to, subject, html) {
   const fromEmail =
     process.env.SENDGRID_FROM_EMAIL?.trim() ||
     process.env.SMTP_FROM?.trim() ||
-    process.env.SMTP_USER?.trim();
+    resolveSmtpUser();
   if (!key) throw new Error("SENDGRID_API_KEY missing");
   if (!fromEmail) {
     throw new Error("Set SENDGRID_FROM_EMAIL (verified sender) or SMTP_FROM");
@@ -311,10 +349,7 @@ function normalizeParentEmail(raw) {
 /** Gmail / SMTP: From address is SMTP_FROM (or SMTP_USER). Parents see "Kidora <kidoraapp06@gmail.com>" when using defaults. */
 async function sendViaConfiguredSmtp(to, subject, html) {
   const tx = getTransporter();
-  const fromRaw =
-    process.env.SMTP_FROM?.trim() ||
-    process.env.SMTP_USER?.trim() ||
-    "";
+  const fromRaw = process.env.SMTP_FROM?.trim() || resolveSmtpUser() || "";
   if (!tx) {
     return { skipped: true, reason: "no_smtp_transport" };
   }
@@ -387,8 +422,10 @@ async function sendParentEmail(to, subject, html) {
 router.get("/ping", async (_req, res) => {
   try {
     await db.query("SELECT 1 AS ok");
-    const hasUser = !!process.env.SMTP_USER?.trim();
-    const hasPass = !!process.env.SMTP_PASS;
+    const userPick = pickFirstEnv(SMTP_USER_ENV_KEYS);
+    const passPick = pickFirstEnv(SMTP_PASS_ENV_KEYS);
+    const hasUser = !!userPick.value;
+    const hasPass = !!passPick.value;
     const gmailMode = shouldUseGmailServiceTransport();
     const gmailReady = gmailMode && hasUser && hasPass;
     const genericSmtpReady =
@@ -401,11 +438,13 @@ router.get("/ping", async (_req, res) => {
       gmail_mode: gmailMode,
       has_smtp_user: hasUser,
       has_smtp_pass: hasPass,
+      smtp_user_env_key: userPick.key,
+      smtp_pass_env_key: passPick.key,
       smtp_host_set: !!(process.env.SMTP_HOST || "").trim(),
       email_provider: (process.env.EMAIL_PROVIDER || "").trim() || "auto",
       hint: smtpReady
         ? null
-        : "Set SMTP_USER + SMTP_PASS (Gmail app password). For @gmail.com you can omit SMTP_HOST; or set EMAIL_PROVIDER=gmail.",
+        : "Render has no mail credentials yet. Dashboard → your Web Service → Environment → add SMTP_USER (e.g. kidoraapp06@gmail.com) and SMTP_PASS (Gmail 16-char App Password). Optional: SMTP_FROM same as user. Aliases: GMAIL_USER + GMAIL_APP_PASSWORD. Then redeploy.",
     });
   } catch (err) {
     console.error("[safety] ping", err);
