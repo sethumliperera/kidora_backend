@@ -123,6 +123,23 @@ function getSmtpPingDiagnostics() {
   const genericSmtpReady = hostSet && hasUser && hasPass;
   const smtpReady = gmailReady || genericSmtpReady;
   const emailProvider = readEnvKey("EMAIL_PROVIDER").value || "auto";
+  const onRender = !!(process.env.RENDER || process.env.RENDER_SERVICE_ID);
+
+  let hint = null;
+  if (!smtpReady) {
+    hint =
+      "This Node process has no SMTP_USER/SMTP_PASS (or aliases). Add them on the SAME Render Web Service that serves this URL (not only inside an Environment Group). " +
+      "Dashboard: Services -> select kidora-api (or your API service) -> Environment -> add variables OR link your Environment Group here -> Save -> Manual Deploy. " +
+      "Checked keys: " +
+      SMTP_USER_ENV_KEYS.join(", ") +
+      " / " +
+      SMTP_PASS_ENV_KEYS.join(", ") +
+      ".";
+    if (onRender) {
+      hint +=
+        " If you edited an Environment Group only: open the Web Service -> Environment -> link that group to this service.";
+    }
+  }
 
   return {
     smtp_ready: smtpReady,
@@ -133,13 +150,11 @@ function getSmtpPingDiagnostics() {
     smtp_pass_env_key: passPick.matchedKey,
     smtp_host_set: hostSet,
     email_provider: emailProvider || "auto",
-    hint: smtpReady
-      ? null
-      : "No mail credentials in this Node process. In Render: open the Web Service that runs kidora-api (not MySQL), Environment, add SMTP_USER and SMTP_PASS (or GMAIL_USER and GMAIL_APP_PASSWORD). Save, then Manual Deploy. Names checked: " +
-        SMTP_USER_ENV_KEYS.join(", ") +
-        " / " +
-        SMTP_PASS_ENV_KEYS.join(", ") +
-        ".",
+    hint,
+    on_render: onRender,
+    render_service_name: process.env.RENDER_SERVICE_NAME || null,
+    render_external_url: process.env.RENDER_EXTERNAL_URL || null,
+    render_service_id: process.env.RENDER_SERVICE_ID || null,
   };
 }
 
