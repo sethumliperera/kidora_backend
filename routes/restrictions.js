@@ -10,7 +10,46 @@ const sameId = (a, b) => {
     return String(a) === String(b);
 };
 
-const TABLE = "app_restriction";
+let resolvedTable = null;
+
+async function getRestrictionsTable() {
+    if (resolvedTable) return resolvedTable;
+
+    const candidates = [
+        "app_restriction",
+        "app_restrictions",
+        "app_restriction_schedules",
+    ];
+
+    for (const name of candidates) {
+        const [rows] = await db.query("SHOW TABLES LIKE ?", [name]);
+        if (Array.isArray(rows) && rows.length > 0) {
+            resolvedTable = name;
+            return resolvedTable;
+        }
+    }
+
+    throw new Error(
+        `No restrictions table found. Expected one of: ${candidates.join(", ")}`
+    );
+}
+
+const parseListField = (value) => {
+    if (Array.isArray(value)) return value.map(v => String(v));
+    if (value === null || value === undefined) return [];
+    const raw = String(value).trim();
+    if (!raw) return [];
+    try {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) return parsed.map(v => String(v));
+    } catch (_) {
+        // Fallback for comma-separated legacy values.
+    }
+    return raw
+        .split(",")
+        .map(v => v.trim())
+        .filter(Boolean);
+};
 
 async function assertParentOwnsChild(childId, parentId) {
     const [childRows] = await db.query(
@@ -29,6 +68,7 @@ async function assertParentOwnsChild(childId, parentId) {
 // ===============================
 router.post("/", verifyToken, async (req, res) => {
     try {
+        const TABLE = await getRestrictionsTable();
         const parent_id = req.user.id;
 
         const {
@@ -84,6 +124,7 @@ router.post("/", verifyToken, async (req, res) => {
 // ===============================
 router.get("/", verifyToken, async (req, res) => {
     try {
+        const TABLE = await getRestrictionsTable();
         const parent_id = req.user.id;
 
         const [results] = await db.query(
@@ -98,8 +139,8 @@ router.get("/", verifyToken, async (req, res) => {
         // Parse JSON fields
         const parsed = results.map(r => ({
             ...r,
-            days: JSON.parse(r.days || "[]"),
-            blocked_apps: JSON.parse(r.blocked_apps || "[]"),
+            days: parseListField(r.days),
+            blocked_apps: parseListField(r.blocked_apps),
             enabled: !!r.enabled
         }));
 
@@ -117,6 +158,7 @@ router.get("/", verifyToken, async (req, res) => {
 // ===============================
 router.get("/child/:child_id", verifyToken, async (req, res) => {
     try {
+        const TABLE = await getRestrictionsTable();
         const parent_id = req.user.id;
         const { child_id } = req.params;
 
@@ -135,8 +177,8 @@ router.get("/child/:child_id", verifyToken, async (req, res) => {
 
         const parsed = results.map(r => ({
             ...r,
-            days: JSON.parse(r.days || "[]"),
-            blocked_apps: JSON.parse(r.blocked_apps || "[]"),
+            days: parseListField(r.days),
+            blocked_apps: parseListField(r.blocked_apps),
             enabled: !!r.enabled
         }));
 
@@ -144,7 +186,10 @@ router.get("/child/:child_id", verifyToken, async (req, res) => {
 
     } catch (err) {
         console.error("GET CHILD RESTRICTIONS ERROR:", err);
-        res.status(500).json({ error: "Failed to fetch restrictions" });
+        res.status(500).json({
+            error: "Failed to fetch restrictions",
+            details: err.message
+        });
     }
 });
 
@@ -154,6 +199,7 @@ router.get("/child/:child_id", verifyToken, async (req, res) => {
 // ===============================
 router.put("/:id", verifyToken, async (req, res) => {
     try {
+        const TABLE = await getRestrictionsTable();
         const parent_id = req.user.id;
         const { id } = req.params;
 
@@ -216,6 +262,7 @@ router.put("/:id", verifyToken, async (req, res) => {
 // ===============================
 router.patch("/:id/toggle", verifyToken, async (req, res) => {
     try {
+        const TABLE = await getRestrictionsTable();
         const parent_id = req.user.id;
         const { id } = req.params;
 
@@ -259,6 +306,7 @@ router.patch("/:id/toggle", verifyToken, async (req, res) => {
 // ===============================
 router.delete("/:id", verifyToken, async (req, res) => {
     try {
+        const TABLE = await getRestrictionsTable();
         const parent_id = req.user.id;
         const { id } = req.params;
 
@@ -294,6 +342,7 @@ router.delete("/:id", verifyToken, async (req, res) => {
 // ===============================
 router.get("/active/:child_id", async (req, res) => {
     try {
+        const TABLE = await getRestrictionsTable();
         const { child_id } = req.params;
 
         const now = new Date();
@@ -317,7 +366,7 @@ router.get("/active/:child_id", async (req, res) => {
             const start = parseTime(r.start_time);
             const end = parseTime(r.end_time);
 
-            const restrictionDays = JSON.parse(r.days || "[]");
+            const restrictionDays = parseListField(r.days);
             // Normal same-day window (e.g. 14:00 -> 18:00)
             if (start <= end) {
                 if (!restrictionDays.includes(today)) return false;
