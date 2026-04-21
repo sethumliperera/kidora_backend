@@ -10,7 +10,7 @@ const sameId = (a, b) => {
     return String(a) === String(b);
 };
 
-const TABLE = "app_restrictions";
+const TABLE = "app_restriction";
 
 async function assertParentOwnsChild(childId, parentId) {
     const [childRows] = await db.query(
