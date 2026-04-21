@@ -6,6 +6,13 @@ require("dotenv").config({ path: "./.env" });
 console.log("DB HOST:", process.env.MYSQLHOST);
 console.log("DB USER:", process.env.MYSQLUSER);
 console.log("DB NAME:", process.env.MYSQLDATABASE);
+// Inserts (e.g. safety_search_alerts) go to THIS database — must match where you look in Railway/Render.
+const du = String(process.env.DATABASE_URL || "");
+const duHost = du.match(/@([^/?]+)/);
+console.log(
+  "DATABASE_URL host:",
+  duHost ? duHost[1] : du ? "(set, could not parse host)" : "(missing)"
+);
 
 // ===============================
 // IMPORTS
