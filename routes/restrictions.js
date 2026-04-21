@@ -25,10 +25,24 @@ async function getRestrictionsTable() {
         const [rows] = await db.query("SHOW TABLES LIKE ?", [name]);
         if (Array.isArray(rows) && rows.length > 0) {
             resolvedTable = name;
+            console.log(`[Restrictions] Using table: ${resolvedTable}`);
             return resolvedTable;
         }
     }
 
+    const [allTables] = await db.query("SHOW TABLES");
+    const discovered = Array.isArray(allTables)
+        ? allTables
+              .map((r) => {
+                  const v = Object.values(r || {});
+                  return v.length > 0 ? String(v[0]) : "";
+              })
+              .filter(Boolean)
+        : [];
+
+    console.error(
+        `[Restrictions] No matching table found. Candidates=${candidates.join(", ")}. Existing tables=${discovered.join(", ")}`
+    );
     throw new Error(
         `No restrictions table found. Expected one of: ${candidates.join(", ")}`
     );
