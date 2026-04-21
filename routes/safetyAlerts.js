@@ -1,7 +1,7 @@
 const express = require("express");
 const router = express.Router();
 const db = require("../db");
-const nodemailer = require("nodemailer");
+const { resolveSmtpUser, getTransporter, getSmtpPingDiagnostics } = require("../smtpEnv");
 
 /** Default substring checks (lowercase). Extend via env BAD_SEARCH_PHRASES=comma,separated */
 const DEFAULT_BLOCKED_PHRASES = [
@@ -155,108 +155,6 @@ function buildFlaggedSearchEmailHtml({
     </div>
   </div>
 </body></html>`;
-}
-
-let transporter = null;
-
-/** Render / hosts often use different names — we accept these for Kidora Gmail. */
-const SMTP_USER_ENV_KEYS = [
-  "SMTP_USER",
-  "GMAIL_USER",
-  "GMAIL_ADDRESS",
-  "EMAIL_USER",
-  "MAIL_USERNAME",
-  "MAIL_USER",
-];
-const SMTP_PASS_ENV_KEYS = [
-  "SMTP_PASS",
-  "SMTP_PASSWORD",
-  "GMAIL_APP_PASSWORD",
-  "GMAIL_PASSWORD",
-  "EMAIL_PASSWORD",
-  "MAIL_PASSWORD",
-];
-
-function pickFirstEnv(keys) {
-  for (const k of keys) {
-    const raw = process.env[k];
-    if (raw == null) continue;
-    const v = String(raw).trim();
-    if (v !== "") return { key: k, value: v };
-  }
-  return { key: null, value: "" };
-}
-
-function resolveSmtpUser() {
-  return pickFirstEnv(SMTP_USER_ENV_KEYS).value;
-}
-
-function resolveSmtpPass() {
-  return pickFirstEnv(SMTP_PASS_ENV_KEYS).value;
-}
-
-function isLikelyGmailAccount(userRaw) {
-  const u = String(userRaw || "")
-    .trim()
-    .toLowerCase();
-  return u.endsWith("@gmail.com") || u.endsWith("@googlemail.com");
-}
-
-/**
- * Use nodemailer's `service: "gmail"` (no SMTP_HOST required).
- * Also auto-detect: many hosts only set SMTP_USER=…@gmail.com + app password and omit EMAIL_PROVIDER.
- */
-function shouldUseGmailServiceTransport() {
-  const provider = (process.env.EMAIL_PROVIDER || "").toLowerCase().trim();
-  const svc = (process.env.SMTP_SERVICE || "").toLowerCase().trim();
-  const hostRaw = (process.env.SMTP_HOST || "").trim();
-  const host = hostRaw.toLowerCase();
-  const user = resolveSmtpUser();
-
-  if (provider === "gmail" || svc === "gmail" || host === "smtp.gmail.com") return true;
-  if (isLikelyGmailAccount(user) && !hostRaw) return true;
-  return false;
-}
-
-function getTransporter() {
-  if (transporter) return transporter;
-  const user = resolveSmtpUser();
-  const pass = resolveSmtpPass();
-  if (!user || !pass) {
-    console.warn(
-      "[safety] No SMTP credentials — set SMTP_USER + SMTP_PASS on the host (or GMAIL_USER + GMAIL_APP_PASSWORD)."
-    );
-    return null;
-  }
-  const auth = { user, pass };
-
-  // Gmail: nodemailer service transport — does NOT require SMTP_HOST (common Render misconfig).
-  if (shouldUseGmailServiceTransport()) {
-    transporter = nodemailer.createTransport({
-      service: "gmail",
-      auth,
-    });
-    return transporter;
-  }
-
-  const host = (process.env.SMTP_HOST || "").trim().toLowerCase();
-  if (!host) {
-    console.warn("[safety] SMTP_HOST missing — set EMAIL_PROVIDER=gmail + SMTP_USER/SMTP_PASS, or SMTP_HOST");
-    return null;
-  }
-
-  const port = parseInt(process.env.SMTP_PORT || "587", 10);
-  const secure = process.env.SMTP_SECURE === "1" || process.env.SMTP_SECURE === "true";
-  transporter = nodemailer.createTransport({
-    host,
-    port,
-    secure,
-    auth,
-    requireTLS: !secure && port === 587,
-    connectionTimeout: 20000,
-    greetingTimeout: 20000,
-  });
-  return transporter;
 }
 
 /**
@@ -422,29 +320,11 @@ async function sendParentEmail(to, subject, html) {
 router.get("/ping", async (_req, res) => {
   try {
     await db.query("SELECT 1 AS ok");
-    const userPick = pickFirstEnv(SMTP_USER_ENV_KEYS);
-    const passPick = pickFirstEnv(SMTP_PASS_ENV_KEYS);
-    const hasUser = !!userPick.value;
-    const hasPass = !!passPick.value;
-    const gmailMode = shouldUseGmailServiceTransport();
-    const gmailReady = gmailMode && hasUser && hasPass;
-    const genericSmtpReady =
-      !!(process.env.SMTP_HOST || "").trim() && hasUser && hasPass;
-    const smtpReady = gmailReady || genericSmtpReady;
+    const mail = getSmtpPingDiagnostics();
     return res.json({
       ok: true,
       db: true,
-      smtp_ready: smtpReady,
-      gmail_mode: gmailMode,
-      has_smtp_user: hasUser,
-      has_smtp_pass: hasPass,
-      smtp_user_env_key: userPick.key,
-      smtp_pass_env_key: passPick.key,
-      smtp_host_set: !!(process.env.SMTP_HOST || "").trim(),
-      email_provider: (process.env.EMAIL_PROVIDER || "").trim() || "auto",
-      hint: smtpReady
-        ? null
-        : "Render has no mail credentials yet. Dashboard → your Web Service → Environment → add SMTP_USER (e.g. kidoraapp06@gmail.com) and SMTP_PASS (Gmail 16-char App Password). Optional: SMTP_FROM same as user. Aliases: GMAIL_USER + GMAIL_APP_PASSWORD. Then redeploy.",
+      ...mail,
     });
   } catch (err) {
     console.error("[safety] ping", err);
