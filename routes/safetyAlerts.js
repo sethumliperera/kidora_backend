@@ -66,7 +66,8 @@ function escapeHtml(s) {
 }
 
 /**
- * Parent email: date, time, timezone, searched keywords, child, browser.
+ * Parent email: URGENT banner + child name/date/time/timezone + a browser mockup
+ * whose search box contains the keyword the child typed.
  */
 function buildFlaggedSearchEmailHtml({
   childName,
@@ -88,37 +89,59 @@ function buildFlaggedSearchEmailHtml({
   return `<!DOCTYPE html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
 <body style="margin:0;background:#e8eaf6;font-family:Segoe UI,Roboto,Helvetica,Arial,sans-serif;">
-  <div style="max-width:560px;margin:24px auto;padding:0 12px;">
-    <div style="background:#c62828;color:#fff;padding:14px 18px;border-radius:12px 12px 0 0;font-size:16px;font-weight:800;">
+  <div style="max-width:620px;margin:24px auto;padding:0 12px;">
+
+    <div style="background:#c62828;color:#fff;padding:16px 20px;border-radius:12px 12px 0 0;font-size:17px;font-weight:800;letter-spacing:.3px;">
       URGENT — Kidora flagged search
     </div>
+
     <div style="background:#fff;padding:22px;border:1px solid #d1c4e9;border-top:none;border-radius:0 0 12px 12px;box-shadow:0 8px 24px rgba(94,53,177,0.12);">
-      <p style="margin:0 0 16px;color:#37474f;font-size:15px;line-height:1.55;">
-        <strong>${safeChild}</strong> searched for something that matched your Kidora safety list using <strong>${safePkg}</strong>.
+
+      <p style="margin:0 0 18px;color:#263238;font-size:15px;line-height:1.55;">
+        <strong>${safeChild}</strong> typed a flagged search in <strong>${safePkg}</strong>. Details below.
       </p>
 
-      <table style="width:100%;border-collapse:collapse;margin:0 0 20px;font-size:14px;color:#263238;">
-        <tr style="background:#f3e5f5;"><td style="padding:10px 12px;border:1px solid #e1bee7;font-weight:700;width:38%;">Date (child device)</td><td style="padding:10px 12px;border:1px solid #e1bee7;">${safeDate}</td></tr>
-        <tr><td style="padding:10px 12px;border:1px solid #e1bee7;font-weight:700;">Time (child device)</td><td style="padding:10px 12px;border:1px solid #e1bee7;">${safeTime}</td></tr>
-        <tr style="background:#f3e5f5;"><td style="padding:10px 12px;border:1px solid #e1bee7;font-weight:700;">Time zone</td><td style="padding:10px 12px;border:1px solid #e1bee7;">${safeTz}</td></tr>
-        <tr><td style="padding:10px 12px;border:1px solid #e1bee7;font-weight:700;vertical-align:top;">Searched keyword / phrase</td><td style="padding:10px 12px;border:1px solid #e1bee7;font-size:16px;font-weight:800;color:#6a1b9a;">${safeQuery}</td></tr>
-        <tr style="background:#fafafa;"><td style="padding:10px 12px;border:1px solid #e1bee7;font-weight:700;">Server received (UTC)</td><td style="padding:10px 12px;border:1px solid #e1bee7;font-size:12px;color:#546e7a;">${safeServerUtc}</td></tr>
-      </table>
-
-      <div style="border:1px solid #cfd8dc;border-radius:10px;overflow:hidden;background:#fafafa;">
-        <div style="padding:16px;text-align:center;">
-          <div style="font-size:22px;font-weight:800;letter-spacing:-1px;margin-bottom:12px;">
-            <span style="color:#5e35b1;">S</span><span style="color:#e53935;">e</span><span style="color:#fbc02d;">a</span><span style="color:#5e35b1;">r</span><span style="color:#43a047;">c</span><span style="color:#e53935;">h</span>
+      <!-- Browser mockup with the typed keyword in the search box -->
+      <div style="border:1px solid #b0bec5;border-radius:10px;overflow:hidden;background:#f5f7fa;margin:0 0 22px;box-shadow:0 4px 14px rgba(55,71,79,0.12);">
+        <!-- tab bar -->
+        <div style="background:#cfd8dc;padding:8px 12px;display:flex;align-items:center;">
+          <span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#e53935;margin-right:6px;"></span>
+          <span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#fbc02d;margin-right:6px;"></span>
+          <span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#43a047;margin-right:12px;"></span>
+          <span style="background:#eceff1;color:#37474f;font-size:12px;padding:5px 14px;border-radius:6px 6px 0 0;border:1px solid #b0bec5;border-bottom:none;">New Tab</span>
+        </div>
+        <!-- url bar -->
+        <div style="background:#eceff1;padding:10px 12px;border-top:1px solid #b0bec5;border-bottom:1px solid #b0bec5;font-size:12px;color:#546e7a;">
+          <span style="background:#fff;border:1px solid #b0bec5;border-radius:20px;padding:6px 12px;display:inline-block;min-width:70%;color:#90a4ae;">http://</span>
+        </div>
+        <!-- page body -->
+        <div style="padding:26px 20px 30px;text-align:center;background:#f5f7fa;">
+          <div style="font-size:34px;font-weight:800;letter-spacing:-1px;margin:0 0 18px;">
+            <span style="color:#1a73e8;">S</span><span style="color:#ea4335;">e</span><span style="color:#fbbc04;">a</span><span style="color:#1a73e8;">r</span><span style="color:#34a853;">c</span><span style="color:#ea4335;">h</span>
           </div>
-          <div style="background:#fff;border:1px solid #b0bec5;border-radius:16px;padding:14px 18px;text-align:left;font-size:15px;color:#263238;">
-            ${safeQuery}
+          <div style="background:#fff;border:1px solid #b0bec5;border-radius:24px;padding:12px 18px;max-width:420px;margin:0 auto;text-align:left;font-size:15px;color:#263238;box-shadow:0 1px 2px rgba(0,0,0,0.06);">
+            <strong style="color:#c62828;">${safeQuery}</strong>
+          </div>
+          <div style="margin-top:14px;">
+            <span style="display:inline-block;background:#eceff1;color:#546e7a;font-size:13px;padding:6px 16px;border-radius:18px;">Go</span>
           </div>
         </div>
       </div>
 
-      <p style="margin:18px 0 0;font-size:12px;color:#90a4ae;line-height:1.5;">
-        Open the Kidora parent app to follow up with your child. This alert is based on on-device browser monitoring (Google, Bing, DuckDuckGo, Yahoo, and other common engines when the URL is visible to accessibility).
+      <table style="width:100%;border-collapse:collapse;margin:0 0 18px;font-size:14px;color:#263238;">
+        <tr style="background:#f3e5f5;"><td style="padding:10px 12px;border:1px solid #e1bee7;font-weight:700;width:38%;">Child</td><td style="padding:10px 12px;border:1px solid #e1bee7;">${safeChild}</td></tr>
+        <tr><td style="padding:10px 12px;border:1px solid #e1bee7;font-weight:700;">Date</td><td style="padding:10px 12px;border:1px solid #e1bee7;">${safeDate}</td></tr>
+        <tr style="background:#f3e5f5;"><td style="padding:10px 12px;border:1px solid #e1bee7;font-weight:700;">Time</td><td style="padding:10px 12px;border:1px solid #e1bee7;">${safeTime}</td></tr>
+        <tr><td style="padding:10px 12px;border:1px solid #e1bee7;font-weight:700;">Time zone</td><td style="padding:10px 12px;border:1px solid #e1bee7;">${safeTz}</td></tr>
+        <tr style="background:#f3e5f5;"><td style="padding:10px 12px;border:1px solid #e1bee7;font-weight:700;vertical-align:top;">Searched keyword</td><td style="padding:10px 12px;border:1px solid #e1bee7;font-size:16px;font-weight:800;color:#6a1b9a;">${safeQuery}</td></tr>
+        <tr><td style="padding:10px 12px;border:1px solid #e1bee7;font-weight:700;">App / browser</td><td style="padding:10px 12px;border:1px solid #e1bee7;">${safePkg}</td></tr>
+        <tr style="background:#fafafa;"><td style="padding:10px 12px;border:1px solid #e1bee7;font-weight:700;">Server received (UTC)</td><td style="padding:10px 12px;border:1px solid #e1bee7;font-size:12px;color:#546e7a;">${safeServerUtc}</td></tr>
+      </table>
+
+      <p style="margin:14px 0 0;font-size:12px;color:#90a4ae;line-height:1.5;">
+        Detected on-device by Kidora across Google, Chrome, YouTube, Bing, DuckDuckGo and other common search engines. Open the Kidora parent app to review and follow up with your child.
       </p>
+
     </div>
   </div>
 </body></html>`;
@@ -161,34 +184,8 @@ function getTransporter() {
 }
 
 /**
- * Firebase "Trigger Email from Firestore" extension: add a doc; the extension delivers mail
- * (SMTP/SendGrid is configured inside the extension in Firebase Console, not in this Node app).
- * @see https://firebase.google.com/docs/extensions/official/firestore-send-email
- */
-async function sendViaFirestoreTriggerEmail(to, subject, html) {
-  let admin;
-  try {
-    admin = require("../firebaseAdmin");
-  } catch (e) {
-    throw new Error(
-      `Firebase Admin not loadable (need valid firebaseAdmin + service account on this host): ${e.message}`
-    );
-  }
-  const fs = admin.firestore();
-  const col = (process.env.FIRESTORE_MAIL_COLLECTION || "mail").trim() || "mail";
-  await fs.collection(col).add({
-    to: [to],
-    message: {
-      subject,
-      html,
-    },
-  });
-}
-
-/**
- * Resend — free tier (https://resend.com), one API key, good for Render.
- * Sign up → API Keys → create key. For testing use from: onboarding@resend.dev (Resend default).
- * For production add & verify your domain in Resend, then set RESEND_FROM to e.g. alerts@yourdomain.com
+ * Resend — optional alternative to Gmail SMTP (https://resend.com).
+ * Only used if RESEND_API_KEY is set and EMAIL_PROVIDER != gmail/smtp.
  */
 async function sendViaResend(to, subject, html) {
   const key = process.env.RESEND_API_KEY?.trim();
@@ -335,15 +332,6 @@ async function sendParentEmail(to, subject, html) {
     return { skipped: false, via: "sendgrid" };
   }
 
-  const useFs =
-    process.env.USE_FIRESTORE_MAIL === "1" ||
-    process.env.USE_FIRESTORE_MAIL === "true";
-  if (useFs) {
-    await sendViaFirestoreTriggerEmail(recipient, subject, html);
-    console.log("[safety] queued email via Firestore collection for", recipient);
-    return { skipped: false, via: "firestore_trigger_email" };
-  }
-
   const smtp = await sendViaConfiguredSmtp(recipient, subject, html);
   if (!smtp.skipped) {
     console.log("[safety] email sent via SMTP to", recipient, smtp.messageId || "");
@@ -351,7 +339,7 @@ async function sendParentEmail(to, subject, html) {
   }
 
   console.warn(
-    "[safety] No mail transport: set EMAIL_PROVIDER=gmail + SMTP_* for kidoraapp06@gmail.com, or RESEND_API_KEY, or SENDGRID_API_KEY, or USE_FIRESTORE_MAIL=1. Parent:",
+    "[safety] No mail transport: set EMAIL_PROVIDER=gmail + SMTP_* for kidoraapp06@gmail.com (or RESEND_API_KEY / SENDGRID_API_KEY). Parent:",
     recipient
   );
   return { skipped: true, reason: "no_mailer_config" };
