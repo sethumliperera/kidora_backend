@@ -24,6 +24,15 @@ const DEFAULT_BLOCKED_PHRASES = [
   "make a bomb",
   "terrorist",
   "child abuse",
+  "vape",
+  "weed",
+  "weed vape",
+  "weed vape pen",
+  "weed vape pen battery",
+  "weed vape pen cartridge",
+  "weed vape pen cartridge battery",
+  "Ciggarates"
+
 ];
 
 function loadBlockedPhrases() {
@@ -57,49 +66,58 @@ function escapeHtml(s) {
 }
 
 /**
- * Browser-style search page template (Kidora branded).
+ * Parent email: date, time, timezone, searched keywords, child, browser.
  */
-function buildFlaggedSearchEmailHtml({ childName, query, sourcePackage, detectedAt }) {
+function buildFlaggedSearchEmailHtml({
+  childName,
+  query,
+  sourcePackage,
+  deviceLocalDate,
+  deviceLocalTime,
+  deviceTimezone,
+  serverReceivedUtc,
+}) {
   const safeQuery = escapeHtml(query);
   const safeChild = escapeHtml(childName || "Your child");
   const safePkg = escapeHtml(sourcePackage || "Browser");
-  const when = escapeHtml(detectedAt || new Date().toISOString());
+  const safeDate = escapeHtml(deviceLocalDate || "—");
+  const safeTime = escapeHtml(deviceLocalTime || "—");
+  const safeTz = escapeHtml(deviceTimezone || "—");
+  const safeServerUtc = escapeHtml(serverReceivedUtc || new Date().toISOString());
 
   return `<!DOCTYPE html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
 <body style="margin:0;background:#e8eaf6;font-family:Segoe UI,Roboto,Helvetica,Arial,sans-serif;">
   <div style="max-width:560px;margin:24px auto;padding:0 12px;">
-    <div style="background:#5e35b1;color:#fff;padding:14px 18px;border-radius:12px 12px 0 0;font-size:15px;font-weight:700;">
-      Kidora - Urgent safety alert
+    <div style="background:#c62828;color:#fff;padding:14px 18px;border-radius:12px 12px 0 0;font-size:16px;font-weight:800;">
+      URGENT — Kidora flagged search
     </div>
     <div style="background:#fff;padding:22px;border:1px solid #d1c4e9;border-top:none;border-radius:0 0 12px 12px;box-shadow:0 8px 24px rgba(94,53,177,0.12);">
-      <p style="margin:0 0 12px;color:#37474f;font-size:14px;line-height:1.5;">
-        <strong>${safeChild}</strong> ran a flagged web search from <strong>${safePkg}</strong>.
+      <p style="margin:0 0 16px;color:#37474f;font-size:15px;line-height:1.55;">
+        <strong>${safeChild}</strong> searched for something that matched your Kidora safety list using <strong>${safePkg}</strong>.
       </p>
-      <p style="margin:0 0 16px;color:#78909c;font-size:12px;">Detected (UTC): ${when}</p>
+
+      <table style="width:100%;border-collapse:collapse;margin:0 0 20px;font-size:14px;color:#263238;">
+        <tr style="background:#f3e5f5;"><td style="padding:10px 12px;border:1px solid #e1bee7;font-weight:700;width:38%;">Date (child device)</td><td style="padding:10px 12px;border:1px solid #e1bee7;">${safeDate}</td></tr>
+        <tr><td style="padding:10px 12px;border:1px solid #e1bee7;font-weight:700;">Time (child device)</td><td style="padding:10px 12px;border:1px solid #e1bee7;">${safeTime}</td></tr>
+        <tr style="background:#f3e5f5;"><td style="padding:10px 12px;border:1px solid #e1bee7;font-weight:700;">Time zone</td><td style="padding:10px 12px;border:1px solid #e1bee7;">${safeTz}</td></tr>
+        <tr><td style="padding:10px 12px;border:1px solid #e1bee7;font-weight:700;vertical-align:top;">Searched keyword / phrase</td><td style="padding:10px 12px;border:1px solid #e1bee7;font-size:16px;font-weight:800;color:#6a1b9a;">${safeQuery}</td></tr>
+        <tr style="background:#fafafa;"><td style="padding:10px 12px;border:1px solid #e1bee7;font-weight:700;">Server received (UTC)</td><td style="padding:10px 12px;border:1px solid #e1bee7;font-size:12px;color:#546e7a;">${safeServerUtc}</td></tr>
+      </table>
 
       <div style="border:1px solid #cfd8dc;border-radius:10px;overflow:hidden;background:#fafafa;">
-        <div style="background:#eceff1;padding:8px 10px;display:flex;align-items:center;gap:8px;border-bottom:1px solid #cfd8dc;">
-          <span style="width:10px;height:10px;border-radius:50%;background:#ef5350;display:inline-block;"></span>
-          <span style="width:10px;height:10px;border-radius:50%;background:#ffca28;display:inline-block;"></span>
-          <span style="width:10px;height:10px;border-radius:50%;background:#66bb6a;display:inline-block;"></span>
-          <div style="flex:1;background:#fff;border-radius:6px;padding:6px 10px;font-size:11px;color:#546e7a;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">
-            https://www.google.com/search?q=${encodeURIComponent(query).replace(/'/g, "%27")}
-          </div>
-        </div>
-        <div style="padding:28px 20px;text-align:center;">
-          <div style="font-size:28px;font-weight:800;letter-spacing:-1px;margin-bottom:16px;">
+        <div style="padding:16px;text-align:center;">
+          <div style="font-size:22px;font-weight:800;letter-spacing:-1px;margin-bottom:12px;">
             <span style="color:#5e35b1;">S</span><span style="color:#e53935;">e</span><span style="color:#fbc02d;">a</span><span style="color:#5e35b1;">r</span><span style="color:#43a047;">c</span><span style="color:#e53935;">h</span>
           </div>
-          <div style="background:#fff;border:1px solid #b0bec5;border-radius:24px;padding:14px 18px;text-align:left;font-size:15px;color:#263238;min-height:22px;">
+          <div style="background:#fff;border:1px solid #b0bec5;border-radius:16px;padding:14px 18px;text-align:left;font-size:15px;color:#263238;">
             ${safeQuery}
           </div>
-          <div style="margin-top:14px;display:inline-block;background:#78909c;color:#fff;padding:10px 28px;border-radius:8px;font-size:13px;font-weight:600;">Review in Kidora</div>
         </div>
       </div>
 
       <p style="margin:18px 0 0;font-size:12px;color:#90a4ae;line-height:1.5;">
-        Open the Kidora parent app to follow up. Configure SMTP on the server (SMTP_HOST, SMTP_USER, etc.) to deliver this message; otherwise the alert is logged on the server only.
+        Open the Kidora parent app to follow up with your child. This alert is based on on-device browser monitoring (Google, Bing, DuckDuckGo, Yahoo, and other common engines when the URL is visible to accessibility).
       </p>
     </div>
   </div>
@@ -342,6 +360,12 @@ async function sendParentEmail(to, subject, html) {
 // POST /api/safety/report-flagged-search (child device, no parent JWT)
 router.post("/report-flagged-search", async (req, res) => {
   try {
+    console.log("[safety] POST report-flagged-search", {
+      child_id: req.body?.child_id,
+      has_query: typeof req.body?.query === "string",
+      source_package: req.body?.source_package,
+    });
+
     await db.query(`
       CREATE TABLE IF NOT EXISTS safety_search_alerts (
         id INT AUTO_INCREMENT PRIMARY KEY,
@@ -364,10 +388,15 @@ router.post("/report-flagged-search", async (req, res) => {
 
     const normalized = normalizeQuery(query);
     if (!normalized) {
+      console.warn("[safety] reject: empty query after normalize");
       return res.status(400).json({ ok: false, error: "query required" });
     }
 
     if (!queryMatchesBlocklist(normalized)) {
+      console.warn("[safety] reject: not in blocklist", {
+        childId,
+        preview: `${normalized.slice(0, 60)}${normalized.length > 60 ? "…" : ""}`,
+      });
       return res.status(400).json({ ok: false, error: "query not in safety list" });
     }
 
@@ -398,20 +427,39 @@ router.post("/report-flagged-search", async (req, res) => {
       return res.status(429).json({ ok: false, error: "rate_limited" });
     }
 
+    const deviceLocalDate =
+      typeof req.body.device_local_date === "string"
+        ? req.body.device_local_date.slice(0, 120)
+        : "";
+    const deviceLocalTime =
+      typeof req.body.device_local_time === "string"
+        ? req.body.device_local_time.slice(0, 40)
+        : "";
+    const deviceTimezone =
+      typeof req.body.device_timezone === "string"
+        ? req.body.device_timezone.slice(0, 120)
+        : "";
+    const serverReceivedUtc = new Date().toISOString();
+
     const html = buildFlaggedSearchEmailHtml({
       childName,
       query: query.slice(0, 500),
       sourcePackage,
-      detectedAt: new Date().toISOString(),
+      deviceLocalDate,
+      deviceLocalTime,
+      deviceTimezone,
+      serverReceivedUtc,
     });
 
-    const subject = `[URGENT] Kidora: flagged search — ${childName || "Child"}`;
+    const kw = query.length > 42 ? `${query.slice(0, 42)}…` : query;
+    const subject = `[URGENT] Kidora: "${kw}" — ${childName || "Child"}`;
 
-    // Always persist first so Railway / MySQL shows the row even if SMTP fails or is unset.
+    // Always persist first (same MySQL as process.env.DATABASE_URL on THIS host).
     await db.query(
       `INSERT INTO safety_search_alerts (child_id, query_text, source_package) VALUES (?, ?, ?)`,
       [childId, query.slice(0, 2000), sourcePackage.slice(0, 255)]
     );
+    console.log("[safety] INSERT safety_search_alerts ok", { childId });
 
     let emailSent = false;
     let emailError = null;
@@ -432,7 +480,7 @@ router.post("/report-flagged-search", async (req, res) => {
         [
           rows[0].parent_id,
           childId,
-          `Flagged search: "${query.slice(0, 120)}${query.length > 120 ? "..." : ""}"`,
+          `Flagged search at ${deviceLocalDate || "?"} ${deviceLocalTime || "?"} (${deviceTimezone || "?"}): "${query.slice(0, 100)}${query.length > 100 ? "…" : ""}"`,
           "safety_search",
         ]
       );
