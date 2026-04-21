@@ -14,6 +14,9 @@ console.log(
   duHost ? duHost[1] : du ? "(set, could not parse host)" : "(missing)"
 );
 
+const { logSmtpStartup } = require("./smtpEnv");
+logSmtpStartup();
+
 // ===============================
 // IMPORTS
 // ===============================
