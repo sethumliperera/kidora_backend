@@ -159,11 +159,27 @@ function buildFlaggedSearchEmailHtml({
 
 let transporter = null;
 
+function isLikelyGmailAccount(userRaw) {
+  const u = String(userRaw || "")
+    .trim()
+    .toLowerCase();
+  return u.endsWith("@gmail.com") || u.endsWith("@googlemail.com");
+}
+
+/**
+ * Use nodemailer's `service: "gmail"` (no SMTP_HOST required).
+ * Also auto-detect: many hosts only set SMTP_USER=…@gmail.com + app password and omit EMAIL_PROVIDER.
+ */
 function shouldUseGmailServiceTransport() {
   const provider = (process.env.EMAIL_PROVIDER || "").toLowerCase().trim();
   const svc = (process.env.SMTP_SERVICE || "").toLowerCase().trim();
-  const host = (process.env.SMTP_HOST || "").trim().toLowerCase();
-  return provider === "gmail" || svc === "gmail" || host === "smtp.gmail.com";
+  const hostRaw = (process.env.SMTP_HOST || "").trim();
+  const host = hostRaw.toLowerCase();
+  const user = process.env.SMTP_USER?.trim();
+
+  if (provider === "gmail" || svc === "gmail" || host === "smtp.gmail.com") return true;
+  if (isLikelyGmailAccount(user) && !hostRaw) return true;
+  return false;
 }
 
 function getTransporter() {
@@ -371,17 +387,25 @@ async function sendParentEmail(to, subject, html) {
 router.get("/ping", async (_req, res) => {
   try {
     await db.query("SELECT 1 AS ok");
-    const gmailReady = shouldUseGmailServiceTransport() && !!process.env.SMTP_USER?.trim() && !!process.env.SMTP_PASS;
+    const hasUser = !!process.env.SMTP_USER?.trim();
+    const hasPass = !!process.env.SMTP_PASS;
+    const gmailMode = shouldUseGmailServiceTransport();
+    const gmailReady = gmailMode && hasUser && hasPass;
     const genericSmtpReady =
-      !!(process.env.SMTP_HOST || "").trim() &&
-      !!process.env.SMTP_USER?.trim() &&
-      !!process.env.SMTP_PASS;
+      !!(process.env.SMTP_HOST || "").trim() && hasUser && hasPass;
     const smtpReady = gmailReady || genericSmtpReady;
     return res.json({
       ok: true,
       db: true,
       smtp_ready: smtpReady,
-      gmail_mode: shouldUseGmailServiceTransport(),
+      gmail_mode: gmailMode,
+      has_smtp_user: hasUser,
+      has_smtp_pass: hasPass,
+      smtp_host_set: !!(process.env.SMTP_HOST || "").trim(),
+      email_provider: (process.env.EMAIL_PROVIDER || "").trim() || "auto",
+      hint: smtpReady
+        ? null
+        : "Set SMTP_USER + SMTP_PASS (Gmail app password). For @gmail.com you can omit SMTP_HOST; or set EMAIL_PROVIDER=gmail.",
     });
   } catch (err) {
     console.error("[safety] ping", err);
