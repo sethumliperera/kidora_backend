@@ -123,14 +123,40 @@ function getTransporter() {
   return transporter;
 }
 
+/** Single recipient: parent of the child only. */
+function normalizeParentEmail(raw) {
+  const s = String(raw || "").trim();
+  if (!s || !s.includes("@")) return null;
+  if (s.includes(",") || s.includes(";")) return null;
+  return s;
+}
+
 async function sendParentEmail(to, subject, html) {
+  const recipient = normalizeParentEmail(to);
+  if (!recipient) {
+    console.warn("[safety] invalid parent email, skip send");
+    return { skipped: true, reason: "invalid_email" };
+  }
+
   const tx = getTransporter();
   const from = process.env.SMTP_FROM || process.env.SMTP_USER || "noreply@kidora.local";
   if (!tx) {
-    console.warn("[safety] SMTP not configured - would email", to, subject);
-    return { skipped: true };
+    console.warn("[safety] SMTP not configured - alert saved in DB, email skipped for", recipient);
+    return { skipped: true, reason: "no_smtp" };
   }
-  await tx.sendMail({ from, to, subject, html });
+
+  await tx.sendMail({
+    from,
+    to: recipient,
+    subject,
+    html,
+    headers: {
+      "X-Priority": "1",
+      Importance: "high",
+      Priority: "urgent",
+      "X-MSMail-Priority": "High",
+    },
+  });
   return { skipped: false };
 }
 
@@ -179,8 +205,9 @@ router.post("/report-flagged-search", async (req, res) => {
     }
 
     const { name: childName, parent_email: parentEmail } = rows[0];
-    if (!parentEmail) {
-      return res.status(400).json({ ok: false, error: "parent email missing" });
+    const parentEmailNorm = normalizeParentEmail(parentEmail);
+    if (!parentEmailNorm) {
+      return res.status(400).json({ ok: false, error: "parent email missing or invalid" });
     }
 
     const [recent] = await db.query(
@@ -199,19 +226,23 @@ router.post("/report-flagged-search", async (req, res) => {
       detectedAt: new Date().toISOString(),
     });
 
-    const subject = `Kidora urgent: flagged search - ${childName || "Child"}`;
+    const subject = `[URGENT] Kidora: flagged search — ${childName || "Child"}`;
 
-    try {
-      await sendParentEmail(parentEmail, subject, html);
-    } catch (mailErr) {
-      console.error("[safety] send mail error", mailErr);
-      return res.status(500).json({ ok: false, error: "email_failed" });
-    }
-
+    // Always persist first so Railway / MySQL shows the row even if SMTP fails or is unset.
     await db.query(
       `INSERT INTO safety_search_alerts (child_id, query_text, source_package) VALUES (?, ?, ?)`,
       [childId, query.slice(0, 2000), sourcePackage.slice(0, 255)]
     );
+
+    let emailSent = false;
+    let emailError = null;
+    try {
+      const mailResult = await sendParentEmail(parentEmailNorm, subject, html);
+      emailSent = !mailResult.skipped;
+    } catch (mailErr) {
+      console.error("[safety] send mail error (row already saved)", mailErr);
+      emailError = "email_failed";
+    }
 
     try {
       await db.query(
@@ -227,7 +258,12 @@ router.post("/report-flagged-search", async (req, res) => {
       console.warn("[safety] notification insert", notifErr.message);
     }
 
-    return res.json({ ok: true });
+    return res.json({
+      ok: true,
+      logged: true,
+      email_sent: emailSent,
+      email_error: emailError,
+    });
   } catch (err) {
     console.error("[safety] report-flagged-search", err);
     return res.status(500).json({ ok: false, error: "server_error" });
