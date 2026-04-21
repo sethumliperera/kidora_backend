@@ -3,6 +3,27 @@ const router = express.Router();
 const db = require("../db");
 const verifyToken = require("../middleware/authMiddleware");
 
+const sameId = (a, b) => {
+    const na = Number(a);
+    const nb = Number(b);
+    if (!Number.isNaN(na) && !Number.isNaN(nb)) return na === nb;
+    return String(a) === String(b);
+};
+
+const TABLE = "app_restrictions";
+
+async function assertParentOwnsChild(childId, parentId) {
+    const [childRows] = await db.query(
+        "SELECT parent_id FROM children WHERE id = ?",
+        [childId]
+    );
+    if (childRows.length === 0) return { ok: false, status: 404, message: "Child not found" };
+    if (!sameId(childRows[0].parent_id, parentId)) {
+        return { ok: false, status: 403, message: "Unauthorized" };
+    }
+    return { ok: true };
+}
+
 // ===============================
 // CREATE RESTRICTION
 // ===============================
@@ -26,26 +47,16 @@ router.post("/", verifyToken, async (req, res) => {
             });
         }
 
-        // Verify parent owns child
-        const [childRows] = await db.query(
-            "SELECT parent_id FROM children WHERE id = ?",
-            [child_id]
-        );
-
-        if (childRows.length === 0) {
-            return res.status(404).json({ message: "Child not found" });
-        }
-
-        if (childRows[0].parent_id !== parent_id) {
-            return res.status(403).json({ message: "Unauthorized" });
+        const ownCheck = await assertParentOwnsChild(child_id, parent_id);
+        if (!ownCheck.ok) {
+            return res.status(ownCheck.status).json({ message: ownCheck.message });
         }
 
         const [result] = await db.query(
-            `INSERT INTO restrictions 
-            (parent_id, child_id, type, start_time, end_time, days, blocked_apps, enabled)
+            `INSERT INTO ${TABLE}
+            (child_id, name, start_time, end_time, days, blocked_apps, is_enabled)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
             [
-                parent_id,
                 child_id,
                 type,
                 start_time || null,
@@ -76,10 +87,10 @@ router.get("/", verifyToken, async (req, res) => {
         const parent_id = req.user.id;
 
         const [results] = await db.query(
-            `SELECT r.*, c.name AS child_name
-             FROM restrictions r
+            `SELECT r.id, r.child_id, r.name AS type, r.start_time, r.end_time, r.days, r.blocked_apps, r.is_enabled AS enabled, r.created_at, r.updated_at, c.name AS child_name
+             FROM ${TABLE} r
              JOIN children c ON r.child_id = c.id
-             WHERE r.parent_id = ?
+             WHERE c.parent_id = ?
              ORDER BY r.created_at DESC`,
             [parent_id]
         );
@@ -109,24 +120,17 @@ router.get("/child/:child_id", verifyToken, async (req, res) => {
         const parent_id = req.user.id;
         const { child_id } = req.params;
 
-        const [childRows] = await db.query(
-            "SELECT parent_id FROM children WHERE id = ?",
-            [child_id]
-        );
-
-        if (childRows.length === 0) {
-            return res.status(404).json({ message: "Child not found" });
-        }
-
-        if (childRows[0].parent_id !== parent_id) {
-            return res.status(403).json({ message: "Unauthorized" });
+        const ownCheck = await assertParentOwnsChild(child_id, parent_id);
+        if (!ownCheck.ok) {
+            return res.status(ownCheck.status).json({ message: ownCheck.message });
         }
 
         const [results] = await db.query(
-            `SELECT * FROM restrictions
-             WHERE child_id = ? AND parent_id = ?
+            `SELECT id, child_id, name AS type, start_time, end_time, days, blocked_apps, is_enabled AS enabled, created_at, updated_at
+             FROM ${TABLE}
+             WHERE child_id = ?
              ORDER BY created_at DESC`,
-            [child_id, parent_id]
+            [child_id]
         );
 
         const parsed = results.map(r => ({
@@ -154,7 +158,10 @@ router.put("/:id", verifyToken, async (req, res) => {
         const { id } = req.params;
 
         const [rows] = await db.query(
-            "SELECT parent_id FROM restrictions WHERE id = ?",
+            `SELECT r.child_id, c.parent_id
+             FROM ${TABLE} r
+             JOIN children c ON c.id = r.child_id
+             WHERE r.id = ?`,
             [id]
         );
 
@@ -162,7 +169,7 @@ router.put("/:id", verifyToken, async (req, res) => {
             return res.status(404).json({ message: "Restriction not found" });
         }
 
-        if (rows[0].parent_id !== parent_id) {
+        if (!sameId(rows[0].parent_id, parent_id)) {
             return res.status(403).json({ message: "Unauthorized" });
         }
 
@@ -176,13 +183,13 @@ router.put("/:id", verifyToken, async (req, res) => {
         } = req.body;
 
         await db.query(
-            `UPDATE restrictions SET
-                type = ?,
+            `UPDATE ${TABLE} SET
+                name = ?,
                 start_time = ?,
                 end_time = ?,
                 days = ?,
                 blocked_apps = ?,
-                enabled = ?
+                is_enabled = ?
              WHERE id = ?`,
             [
                 type,
@@ -213,7 +220,10 @@ router.patch("/:id/toggle", verifyToken, async (req, res) => {
         const { id } = req.params;
 
         const [rows] = await db.query(
-            "SELECT parent_id, enabled FROM restrictions WHERE id = ?",
+            `SELECT r.child_id, r.is_enabled, c.parent_id
+             FROM ${TABLE} r
+             JOIN children c ON c.id = r.child_id
+             WHERE r.id = ?`,
             [id]
         );
 
@@ -221,14 +231,14 @@ router.patch("/:id/toggle", verifyToken, async (req, res) => {
             return res.status(404).json({ message: "Restriction not found" });
         }
 
-        if (rows[0].parent_id !== parent_id) {
+        if (!sameId(rows[0].parent_id, parent_id)) {
             return res.status(403).json({ message: "Unauthorized" });
         }
 
-        const newStatus = rows[0].enabled ? 0 : 1;
+        const newStatus = rows[0].is_enabled ? 0 : 1;
 
         await db.query(
-            "UPDATE restrictions SET enabled = ? WHERE id = ?",
+            `UPDATE ${TABLE} SET is_enabled = ? WHERE id = ?`,
             [newStatus, id]
         );
 
@@ -253,7 +263,10 @@ router.delete("/:id", verifyToken, async (req, res) => {
         const { id } = req.params;
 
         const [rows] = await db.query(
-            "SELECT parent_id FROM restrictions WHERE id = ?",
+            `SELECT r.child_id, c.parent_id
+             FROM ${TABLE} r
+             JOIN children c ON c.id = r.child_id
+             WHERE r.id = ?`,
             [id]
         );
 
@@ -261,14 +274,11 @@ router.delete("/:id", verifyToken, async (req, res) => {
             return res.status(404).json({ message: "Restriction not found" });
         }
 
-        if (rows[0].parent_id !== parent_id) {
+        if (!sameId(rows[0].parent_id, parent_id)) {
             return res.status(403).json({ message: "Unauthorized" });
         }
 
-        await db.query(
-            "DELETE FROM restrictions WHERE id = ?",
-            [id]
-        );
+        await db.query(`DELETE FROM ${TABLE} WHERE id = ?`, [id]);
 
         res.json({ message: "Deleted successfully" });
 
@@ -295,7 +305,9 @@ router.get("/active/:child_id", async (req, res) => {
         const yesterday = days[(now.getDay() + 6) % 7];
 
         const [rows] = await db.query(
-            "SELECT * FROM restrictions WHERE child_id = ? AND enabled = 1",
+            `SELECT id, child_id, name AS type, start_time, end_time, days, blocked_apps, is_enabled AS enabled, created_at, updated_at
+             FROM ${TABLE}
+             WHERE child_id = ? AND is_enabled = 1`,
             [child_id]
         );
 
