@@ -14,7 +14,6 @@ const express = require("express");
 const cors = require("cors");
 const http = require("http");
 const { Server } = require("socket.io");
-const admin = require("./firebaseAdmin");
 
 // ===============================
 // APP INIT
@@ -53,57 +52,19 @@ const io = new Server(server, {
 
 app.set("io", io);
 
-const isNumericChildRef = (value) =>
-  typeof value === "number" || /^\d+$/.test(String(value || "").trim());
-
-const resolveChildRooms = async (childRef) => {
-  const rooms = new Set();
-  if (childRef === undefined || childRef === null || childRef === "") {
-    return [];
-  }
-
-  const refString = String(childRef).trim();
-  rooms.add(`child_${refString}`);
-
-  try {
-    let rows = [];
-    if (isNumericChildRef(refString)) {
-      const [byId] = await db.query(
-        "SELECT id, child_id FROM children WHERE id = ? LIMIT 1",
-        [Number(refString)]
-      );
-      rows = byId;
-    } else {
-      const [byPublicId] = await db.query(
-        "SELECT id, child_id FROM children WHERE child_id = ? LIMIT 1",
-        [refString]
-      );
-      rows = byPublicId;
-    }
-
-    if (rows.length > 0) {
-      rooms.add(`child_${rows[0].id}`);
-      if (rows[0].child_id) {
-        rooms.add(`child_${rows[0].child_id}`);
-      }
-    }
-  } catch (err) {
-    console.error("⚠ Failed to resolve child rooms:", err.message);
-  }
-
-  return [...rooms];
-};
-
 // ===============================
 // REMINDER SCHEDULER 🔥
 // ===============================
 setInterval(async () => {
   try {
+    const now = new Date();
+
     const [reminders] = await db.query(
       `
       SELECT * FROM reminders
-      WHERE scheduled_at <= NOW() AND is_sent = 0
-      `
+      WHERE scheduled_at <= ? AND is_sent = 0
+      `,
+      [now]
     );
 
     if (reminders.length > 0) {
@@ -120,79 +81,9 @@ setInterval(async () => {
       };
 
       // ✅ SEND TO CHILD VIA SOCKET
-      const rooms = await resolveChildRooms(reminder.child_id);
-      rooms.forEach((room) => io.to(room).emit("new_notification", payload));
+      io.to(`child_${reminder.child_id}`).emit("new_notification", payload);
 
-      // ✅ SEND TO CHILD VIA FCM (works when app is backgrounded/closed)
-      const [childRows] = await db.query(
-        "SELECT fcm_token FROM children WHERE id = ? LIMIT 1",
-        [reminder.child_id]
-      );
-      const fcmToken = childRows?.[0]?.fcm_token;
-      let fcmDelivered = false;
-      if (fcmToken) {
-        try {
-          const messageId = await admin.messaging().send({
-            token: fcmToken,
-            notification: {
-              title: reminder.title || "Reminder",
-              body: reminder.message || "You have a new reminder.",
-            },
-            data: {
-              type: "reminder",
-              reminder_id: String(reminder.id),
-              priority: String(reminder.priority || "normal"),
-              title: String(reminder.title || "Reminder"),
-              message: String(reminder.message || "You have a new reminder."),
-            },
-            android: {
-              priority: "high",
-              notification: {
-                channelId: "kidora_channel",
-                sound: "default",
-              },
-            },
-            apns: {
-              payload: {
-                aps: {
-                  sound: "default",
-                },
-              },
-            },
-          });
-          fcmDelivered = true;
-          console.log(
-            `✅ FCM sent for reminder ${reminder.id} to child ${reminder.child_id}: ${messageId}`
-          );
-        } catch (pushErr) {
-          console.error(
-            `❌ FCM send failed for child ${reminder.child_id}:`,
-            pushErr.message
-          );
-
-          const code = pushErr?.errorInfo?.code || pushErr?.code || "";
-          if (
-            code.includes("registration-token-not-registered") ||
-            code.includes("invalid-registration-token")
-          ) {
-            await db.query("UPDATE children SET fcm_token = NULL WHERE id = ?", [
-              reminder.child_id,
-            ]);
-          }
-        }
-      }
-
-      // If a token exists but FCM failed, keep reminder pending for retry.
-      if (fcmToken && !fcmDelivered) {
-        console.log(
-          `⏳ Skipping mark-as-sent for reminder ${reminder.id}; will retry FCM`
-        );
-        continue;
-      }
-
-      console.log(
-        `📤 Sent reminder to child_${reminder.child_id} (socket${fcmToken ? " + fcm" : " only"})`
-      );
+      console.log(`📤 Sent reminder to child_${reminder.child_id}`);
 
       // ✅ MARK AS SENT
       await db.query(
@@ -208,9 +99,8 @@ setInterval(async () => {
 // ===============================
 // SOCKET HELPERS
 // ===============================
-const sendToChild = async (childId, event, data) => {
-  const rooms = await resolveChildRooms(childId);
-  rooms.forEach((room) => io.to(room).emit(event, data));
+const sendToChild = (childId, event, data) => {
+  io.to(`child_${childId}`).emit(event, data);
 };
 
 const sendToParent = (parentId, event, data) => {
@@ -223,11 +113,10 @@ const sendToParent = (parentId, event, data) => {
 io.on("connection", (socket) => {
   console.log("🟢 Socket connected:", socket.id);
 
-  socket.on("join_child", async (childId) => {
+  socket.on("join_child", (childId) => {
     if (!childId) return;
-    const rooms = await resolveChildRooms(childId);
-    rooms.forEach((room) => socket.join(room));
-    console.log(`👶 Joined child rooms for ${childId}: ${rooms.join(", ")}`);
+    socket.join(`child_${childId}`);
+    console.log(`👶 Joined child room: child_${childId}`);
   });
 
   socket.on("join_parent", (parentId) => {
@@ -253,6 +142,7 @@ app.use("/api/notifications", require("./routes/notifications"));
 app.use("/api/installed-apps", require("./routes/installedApps"));
 app.use("/api/reminders", require("./routes/reminders"));
 app.use("/api/restrictions", require("./routes/restrictions"));
+app.use("/api/safety", require("./routes/safetyAlerts"));
 
 // ===============================
 // TEST
