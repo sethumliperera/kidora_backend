@@ -523,7 +523,29 @@ router.post("/verify-uninstall-pin", async (req, res) => {
       return res.status(404).json({ message: "Parent uninstall PIN is not set" });
     }
 
-    const valid = userRows[0].uninstall_pin_hash === hashPin(String(pin).trim());
+    const submittedPin = String(pin).trim();
+    const storedRaw = String(userRows[0].uninstall_pin_hash || "").trim();
+    const storedLower = storedRaw.toLowerCase();
+
+    // Support legacy formats to avoid locking out existing users:
+    // 1) SHA-256 from older code paths that may have stripped leading zeros.
+    // 2) Plain 4-digit values accidentally stored before hashing was enforced.
+    const legacyNoLeadingZero = String(parseInt(submittedPin, 10));
+    const currentHash = hashPin(submittedPin).toLowerCase();
+    const legacyHash = hashPin(legacyNoLeadingZero).toLowerCase();
+
+    let valid = storedLower === currentHash || storedLower === legacyHash;
+
+    if (!valid && /^\d{4}$/.test(storedRaw)) {
+      valid = storedRaw === submittedPin;
+      if (valid) {
+        await db.query(
+          "UPDATE users SET uninstall_pin_hash = ? WHERE id = ?",
+          [currentHash, parentId]
+        );
+      }
+    }
+
     return res.json({ valid });
   } catch (err) {
     console.error("VERIFY UNINSTALL PIN ERROR:", err);
