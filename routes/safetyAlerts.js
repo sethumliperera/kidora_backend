@@ -109,18 +109,142 @@ function buildFlaggedSearchEmailHtml({ childName, query, sourcePackage, detected
 let transporter = null;
 function getTransporter() {
   if (transporter) return transporter;
-  const host = process.env.SMTP_HOST;
+  const host = (process.env.SMTP_HOST || "").trim().toLowerCase();
   if (!host) return null;
+  const user = process.env.SMTP_USER?.trim();
+  const pass = process.env.SMTP_PASS;
+  if (!user || !pass) {
+    console.warn("[safety] SMTP_HOST set but SMTP_USER or SMTP_PASS missing");
+    return null;
+  }
+  const auth = { user, pass };
+
+  // Gmail: built-in transport avoids TLS/host quirks (use App Password, not normal password).
+  if (host === "smtp.gmail.com" || (process.env.SMTP_SERVICE || "").toLowerCase() === "gmail") {
+    transporter = nodemailer.createTransport({
+      service: "gmail",
+      auth,
+    });
+    return transporter;
+  }
+
+  const port = parseInt(process.env.SMTP_PORT || "587", 10);
+  const secure = process.env.SMTP_SECURE === "1" || process.env.SMTP_SECURE === "true";
   transporter = nodemailer.createTransport({
     host,
-    port: parseInt(process.env.SMTP_PORT || "587", 10),
-    secure: process.env.SMTP_SECURE === "1" || process.env.SMTP_SECURE === "true",
-    auth:
-      process.env.SMTP_USER && process.env.SMTP_PASS
-        ? { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
-        : undefined,
+    port,
+    secure,
+    auth,
+    requireTLS: !secure && port === 587,
+    connectionTimeout: 20000,
+    greetingTimeout: 20000,
   });
   return transporter;
+}
+
+/**
+ * Firebase "Trigger Email from Firestore" extension: add a doc; the extension delivers mail
+ * (SMTP/SendGrid is configured inside the extension in Firebase Console, not in this Node app).
+ * @see https://firebase.google.com/docs/extensions/official/firestore-send-email
+ */
+async function sendViaFirestoreTriggerEmail(to, subject, html) {
+  let admin;
+  try {
+    admin = require("../firebaseAdmin");
+  } catch (e) {
+    throw new Error(
+      `Firebase Admin not loadable (need valid firebaseAdmin + service account on this host): ${e.message}`
+    );
+  }
+  const fs = admin.firestore();
+  const col = (process.env.FIRESTORE_MAIL_COLLECTION || "mail").trim() || "mail";
+  await fs.collection(col).add({
+    to: [to],
+    message: {
+      subject,
+      html,
+    },
+  });
+}
+
+/**
+ * Resend — free tier (https://resend.com), one API key, good for Render.
+ * Sign up → API Keys → create key. For testing use from: onboarding@resend.dev (Resend default).
+ * For production add & verify your domain in Resend, then set RESEND_FROM to e.g. alerts@yourdomain.com
+ */
+async function sendViaResend(to, subject, html) {
+  const key = process.env.RESEND_API_KEY?.trim();
+  const from =
+    process.env.RESEND_FROM?.trim() ||
+    "Kidora <onboarding@resend.dev>";
+  if (!key) throw new Error("RESEND_API_KEY missing");
+
+  const res = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${key}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      from,
+      to: [to],
+      subject,
+      html,
+      headers: {
+        "X-Priority": "1",
+        Importance: "high",
+      },
+    }),
+  });
+
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Resend HTTP ${res.status}: ${body.slice(0, 500)}`);
+  }
+}
+
+/**
+ * SendGrid Web API. Free tier ~100 emails/day for new accounts.
+ */
+async function sendViaSendGrid(to, subject, html) {
+  const key = process.env.SENDGRID_API_KEY;
+  const fromEmail =
+    process.env.SENDGRID_FROM_EMAIL?.trim() ||
+    process.env.SMTP_FROM?.trim() ||
+    process.env.SMTP_USER?.trim();
+  if (!key) throw new Error("SENDGRID_API_KEY missing");
+  if (!fromEmail) {
+    throw new Error("Set SENDGRID_FROM_EMAIL (verified sender) or SMTP_FROM");
+  }
+
+  const res = await fetch("https://api.sendgrid.com/v3/mail/send", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${key}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      personalizations: [
+        {
+          to: [{ email: to }],
+          subject,
+          headers: {
+            "X-Priority": "1",
+            Importance: "high",
+            Priority: "urgent",
+          },
+        },
+      ],
+      from: { email: fromEmail, name: "Kidora" },
+      content: [{ type: "text/html", value: html }],
+      categories: ["kidora", "safety_alert"],
+    }),
+  });
+
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`SendGrid HTTP ${res.status}: ${body.slice(0, 500)}`);
+  }
 }
 
 /** Single recipient: parent of the child only. */
@@ -138,15 +262,42 @@ async function sendParentEmail(to, subject, html) {
     return { skipped: true, reason: "invalid_email" };
   }
 
-  const tx = getTransporter();
-  const from = process.env.SMTP_FROM || process.env.SMTP_USER || "noreply@kidora.local";
-  if (!tx) {
-    console.warn("[safety] SMTP not configured - alert saved in DB, email skipped for", recipient);
-    return { skipped: true, reason: "no_smtp" };
+  if (process.env.RESEND_API_KEY) {
+    await sendViaResend(recipient, subject, html);
+    console.log("[safety] email sent via Resend to", recipient);
+    return { skipped: false, via: "resend" };
   }
 
-  await tx.sendMail({
-    from,
+  if (process.env.SENDGRID_API_KEY) {
+    await sendViaSendGrid(recipient, subject, html);
+    console.log("[safety] email sent via SendGrid to", recipient);
+    return { skipped: false, via: "sendgrid" };
+  }
+
+  const useFs =
+    process.env.USE_FIRESTORE_MAIL === "1" ||
+    process.env.USE_FIRESTORE_MAIL === "true";
+  if (useFs) {
+    await sendViaFirestoreTriggerEmail(recipient, subject, html);
+    console.log("[safety] queued email via Firestore collection for", recipient);
+    return { skipped: false, via: "firestore_trigger_email" };
+  }
+
+  const tx = getTransporter();
+  const from =
+    process.env.SMTP_FROM?.trim() ||
+    process.env.SMTP_USER?.trim() ||
+    "noreply@kidora.local";
+  if (!tx) {
+    console.warn(
+      "[safety] No mail transport: set RESEND_API_KEY (free Resend), or SENDGRID_API_KEY, or USE_FIRESTORE_MAIL=1, or SMTP_* (Gmail). Parent:",
+      recipient
+    );
+    return { skipped: true, reason: "no_mailer_config" };
+  }
+
+  const info = await tx.sendMail({
+    from: from.includes("<") ? from : `"Kidora" <${from}>`,
     to: recipient,
     subject,
     html,
@@ -157,7 +308,8 @@ async function sendParentEmail(to, subject, html) {
       "X-MSMail-Priority": "High",
     },
   });
-  return { skipped: false };
+  console.log("[safety] email sent via SMTP to", recipient, info.messageId || "");
+  return { skipped: false, via: "smtp", messageId: info.messageId };
 }
 
 // POST /api/safety/report-flagged-search (child device, no parent JWT)
@@ -239,9 +391,12 @@ router.post("/report-flagged-search", async (req, res) => {
     try {
       const mailResult = await sendParentEmail(parentEmailNorm, subject, html);
       emailSent = !mailResult.skipped;
+      if (mailResult.skipped) {
+        emailError = mailResult.reason || "skipped";
+      }
     } catch (mailErr) {
-      console.error("[safety] send mail error (row already saved)", mailErr);
-      emailError = "email_failed";
+      console.error("[safety] send mail error (row already saved)", mailErr?.message || mailErr);
+      emailError = String(mailErr?.message || "email_failed").slice(0, 200);
     }
 
     try {
@@ -263,6 +418,11 @@ router.post("/report-flagged-search", async (req, res) => {
       logged: true,
       email_sent: emailSent,
       email_error: emailError,
+      parent_email_masked: (() => {
+        const [loc, dom] = parentEmailNorm.split("@");
+        if (!dom) return "***";
+        return `${(loc || "?").slice(0, 1)}***@${dom}`;
+      })(),
     });
   } catch (err) {
     console.error("[safety] report-flagged-search", err);
