@@ -31,8 +31,8 @@ const DEFAULT_BLOCKED_PHRASES = [
   "weed vape pen battery",
   "weed vape pen cartridge",
   "weed vape pen cartridge battery",
-  "Ciggarates"
-
+  "ciggarates",
+  "cigarettes",
 ];
 
 function loadBlockedPhrases() {
@@ -409,6 +409,10 @@ router.post("/report-flagged-search", async (req, res) => {
     );
 
     if (!rows.length) {
+      console.warn(
+        "[safety] child not found in THIS server's DB (wrong DATABASE_URL vs dashboard DB?)",
+        { childId }
+      );
       return res.status(404).json({ ok: false, error: "child not found" });
     }
 
