@@ -101,6 +101,16 @@ function buildFlaggedSearchEmailHtml({
         <strong>${safeChild}</strong> typed a flagged search in <strong>${safePkg}</strong>. Details below.
       </p>
 
+      <!-- Google-style strip (like the in-app search bar) -->
+      <div style="background:#fff;border:1px solid #dfe1e5;border-radius:12px;padding:14px 16px;margin:0 0 18px;box-shadow:0 1px 3px rgba(0,0,0,0.08);">
+        <div style="font-size:22px;font-weight:500;margin-bottom:10px;letter-spacing:-0.5px;">
+          <span style="color:#4285f4;">G</span><span style="color:#ea4335;">o</span><span style="color:#fbbc04;">o</span><span style="color:#4285f4;">g</span><span style="color:#34a853;">l</span><span style="color:#ea4335;">e</span>
+        </div>
+        <div style="border:1px solid #dfe1e5;border-radius:24px;padding:10px 16px;font-size:16px;color:#202124;background:#fff;">
+          <span style="color:#c62828;font-weight:700;">${safeQuery}</span>
+        </div>
+      </div>
+
       <!-- Browser mockup with the typed keyword in the search box -->
       <div style="border:1px solid #b0bec5;border-radius:10px;overflow:hidden;background:#f5f7fa;margin:0 0 22px;box-shadow:0 4px 14px rgba(55,71,79,0.12);">
         <!-- tab bar -->
@@ -148,25 +158,37 @@ function buildFlaggedSearchEmailHtml({
 }
 
 let transporter = null;
+
+function shouldUseGmailServiceTransport() {
+  const provider = (process.env.EMAIL_PROVIDER || "").toLowerCase().trim();
+  const svc = (process.env.SMTP_SERVICE || "").toLowerCase().trim();
+  const host = (process.env.SMTP_HOST || "").trim().toLowerCase();
+  return provider === "gmail" || svc === "gmail" || host === "smtp.gmail.com";
+}
+
 function getTransporter() {
   if (transporter) return transporter;
-  const host = (process.env.SMTP_HOST || "").trim().toLowerCase();
-  if (!host) return null;
   const user = process.env.SMTP_USER?.trim();
   const pass = process.env.SMTP_PASS;
   if (!user || !pass) {
-    console.warn("[safety] SMTP_HOST set but SMTP_USER or SMTP_PASS missing");
+    console.warn("[safety] SMTP_USER or SMTP_PASS missing — cannot send email");
     return null;
   }
   const auth = { user, pass };
 
-  // Gmail: built-in transport avoids TLS/host quirks (use App Password, not normal password).
-  if (host === "smtp.gmail.com" || (process.env.SMTP_SERVICE || "").toLowerCase() === "gmail") {
+  // Gmail: nodemailer service transport — does NOT require SMTP_HOST (common Render misconfig).
+  if (shouldUseGmailServiceTransport()) {
     transporter = nodemailer.createTransport({
       service: "gmail",
       auth,
     });
     return transporter;
+  }
+
+  const host = (process.env.SMTP_HOST || "").trim().toLowerCase();
+  if (!host) {
+    console.warn("[safety] SMTP_HOST missing — set EMAIL_PROVIDER=gmail + SMTP_USER/SMTP_PASS, or SMTP_HOST");
+    return null;
   }
 
   const port = parseInt(process.env.SMTP_PORT || "587", 10);
@@ -345,6 +367,28 @@ async function sendParentEmail(to, subject, html) {
   return { skipped: true, reason: "no_mailer_config" };
 }
 
+// GET /api/safety/ping — verify DB + mail config (no auth; for deploy checks only)
+router.get("/ping", async (_req, res) => {
+  try {
+    await db.query("SELECT 1 AS ok");
+    const gmailReady = shouldUseGmailServiceTransport() && !!process.env.SMTP_USER?.trim() && !!process.env.SMTP_PASS;
+    const genericSmtpReady =
+      !!(process.env.SMTP_HOST || "").trim() &&
+      !!process.env.SMTP_USER?.trim() &&
+      !!process.env.SMTP_PASS;
+    const smtpReady = gmailReady || genericSmtpReady;
+    return res.json({
+      ok: true,
+      db: true,
+      smtp_ready: smtpReady,
+      gmail_mode: shouldUseGmailServiceTransport(),
+    });
+  } catch (err) {
+    console.error("[safety] ping", err);
+    return res.status(500).json({ ok: false, db: false, error: String(err?.message || err) });
+  }
+});
+
 // POST /api/safety/report-flagged-search (child device, no parent JWT)
 router.post("/report-flagged-search", async (req, res) => {
   try {
@@ -401,7 +445,12 @@ router.post("/report-flagged-search", async (req, res) => {
         "[safety] child not found in THIS server's DB (wrong DATABASE_URL vs dashboard DB?)",
         { childId }
       );
-      return res.status(404).json({ ok: false, error: "child not found" });
+      return res.status(404).json({
+        ok: false,
+        error: "child not found",
+        hint:
+          "This API uses DATABASE_URL on the host (e.g. Render). Point it at the same MySQL as Railway if you expect rows there.",
+      });
     }
 
     const { name: childName, parent_email: parentEmail } = rows[0];
@@ -493,7 +542,11 @@ router.post("/report-flagged-search", async (req, res) => {
     });
   } catch (err) {
     console.error("[safety] report-flagged-search", err);
-    return res.status(500).json({ ok: false, error: "server_error" });
+    return res.status(500).json({
+      ok: false,
+      error: "server_error",
+      detail: String(err?.message || err).slice(0, 300),
+    });
   }
 });
 
