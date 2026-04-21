@@ -255,11 +255,54 @@ function normalizeParentEmail(raw) {
   return s;
 }
 
+/** Gmail / SMTP: From address is SMTP_FROM (or SMTP_USER). Parents see "Kidora <kidoraapp06@gmail.com>" when using defaults. */
+async function sendViaConfiguredSmtp(to, subject, html) {
+  const tx = getTransporter();
+  const fromRaw =
+    process.env.SMTP_FROM?.trim() ||
+    process.env.SMTP_USER?.trim() ||
+    "";
+  if (!tx) {
+    return { skipped: true, reason: "no_smtp_transport" };
+  }
+  if (!fromRaw) {
+    return { skipped: true, reason: "no_smtp_from_set_SMTP_FROM_or_SMTP_USER" };
+  }
+
+  const fromHeader = fromRaw.includes("<") ? fromRaw : `"Kidora" <${fromRaw}>`;
+  const info = await tx.sendMail({
+    from: fromHeader,
+    to,
+    subject,
+    html,
+    headers: {
+      "X-Priority": "1",
+      Importance: "high",
+      Priority: "urgent",
+      "X-MSMail-Priority": "High",
+    },
+  });
+  return { skipped: false, via: "smtp", messageId: info.messageId };
+}
+
 async function sendParentEmail(to, subject, html) {
   const recipient = normalizeParentEmail(to);
   if (!recipient) {
     console.warn("[safety] invalid parent email, skip send");
     return { skipped: true, reason: "invalid_email" };
+  }
+
+  const prefer = (process.env.EMAIL_PROVIDER || "auto").toLowerCase().trim();
+  const smtpFirst = prefer === "smtp" || prefer === "gmail";
+
+  if (smtpFirst) {
+    const smtp = await sendViaConfiguredSmtp(recipient, subject, html);
+    if (!smtp.skipped) {
+      console.log("[safety] email sent via SMTP to", recipient, smtp.messageId || "");
+      return smtp;
+    }
+    console.warn("[safety] EMAIL_PROVIDER=gmail/smtp but SMTP send skipped:", smtp.reason);
+    return { skipped: true, reason: smtp.reason || "smtp_not_configured" };
   }
 
   if (process.env.RESEND_API_KEY) {
@@ -283,33 +326,17 @@ async function sendParentEmail(to, subject, html) {
     return { skipped: false, via: "firestore_trigger_email" };
   }
 
-  const tx = getTransporter();
-  const from =
-    process.env.SMTP_FROM?.trim() ||
-    process.env.SMTP_USER?.trim() ||
-    "noreply@kidora.local";
-  if (!tx) {
-    console.warn(
-      "[safety] No mail transport: set RESEND_API_KEY (free Resend), or SENDGRID_API_KEY, or USE_FIRESTORE_MAIL=1, or SMTP_* (Gmail). Parent:",
-      recipient
-    );
-    return { skipped: true, reason: "no_mailer_config" };
+  const smtp = await sendViaConfiguredSmtp(recipient, subject, html);
+  if (!smtp.skipped) {
+    console.log("[safety] email sent via SMTP to", recipient, smtp.messageId || "");
+    return smtp;
   }
 
-  const info = await tx.sendMail({
-    from: from.includes("<") ? from : `"Kidora" <${from}>`,
-    to: recipient,
-    subject,
-    html,
-    headers: {
-      "X-Priority": "1",
-      Importance: "high",
-      Priority: "urgent",
-      "X-MSMail-Priority": "High",
-    },
-  });
-  console.log("[safety] email sent via SMTP to", recipient, info.messageId || "");
-  return { skipped: false, via: "smtp", messageId: info.messageId };
+  console.warn(
+    "[safety] No mail transport: set EMAIL_PROVIDER=gmail + SMTP_* for kidoraapp06@gmail.com, or RESEND_API_KEY, or SENDGRID_API_KEY, or USE_FIRESTORE_MAIL=1. Parent:",
+    recipient
+  );
+  return { skipped: true, reason: "no_mailer_config" };
 }
 
 // POST /api/safety/report-flagged-search (child device, no parent JWT)
