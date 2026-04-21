@@ -379,6 +379,7 @@ router.get("/active/:child_id", async (req, res) => {
 
             const start = parseTime(r.start_time);
             const end = parseTime(r.end_time);
+            if (start === null || end === null) return false;
 
             const restrictionDays = parseListField(r.days);
             // Normal same-day window (e.g. 14:00 -> 18:00)
@@ -406,8 +407,31 @@ router.get("/active/:child_id", async (req, res) => {
 
 // helper
 function parseTime(timeStr) {
-    const [h, m] = timeStr.split(":").map(Number);
-    return h * 60 + m;
+    const raw = String(timeStr || "").trim();
+    if (!raw) return null;
+
+    // 24h format: HH:mm or H:mm
+    let match = raw.match(/^(\d{1,2}):(\d{2})$/);
+    if (match) {
+        const h = Number(match[1]);
+        const m = Number(match[2]);
+        if (h >= 0 && h <= 23 && m >= 0 && m <= 59) return h * 60 + m;
+        return null;
+    }
+
+    // 12h format: h:mm AM/PM
+    match = raw.match(/^(\d{1,2}):(\d{2})\s*([AaPp][Mm])$/);
+    if (match) {
+        let h = Number(match[1]);
+        const m = Number(match[2]);
+        const meridian = match[3].toLowerCase();
+        if (h < 1 || h > 12 || m < 0 || m > 59) return null;
+        if (meridian === "pm" && h !== 12) h += 12;
+        if (meridian === "am" && h === 12) h = 0;
+        return h * 60 + m;
+    }
+
+    return null;
 }
 
 module.exports = router;
