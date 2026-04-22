@@ -464,21 +464,10 @@ router.post("/report-flagged-search", async (req, res) => {
         [
           rows[0].parent_id,
           childId,
-          `Plot twist! ${childName || "Your child"} searched something spicy at ${deviceLocalTime || "unknown time"} (${deviceTimezone || "local"}). Query: "${query.slice(0, 100)}${query.length > 100 ? "…" : ""}"`,
-          "harmful_content",
+          `Flagged search at ${deviceLocalDate || "?"} ${deviceLocalTime || "?"} (${deviceTimezone || "?"}): "${query.slice(0, 100)}${query.length > 100 ? "…" : ""}"`,
+          "safety_search",
         ]
       );
-
-      const io = req.app.get("io");
-      if (io) {
-        io.to(`parent_${rows[0].parent_id}`).emit("new_notification", {
-          parent_id: rows[0].parent_id,
-          child_id: childId,
-          message: `Plot twist! ${childName || "Your child"} searched something spicy. Check safety alerts for details.`,
-          type: "harmful_content",
-          created_at: new Date(),
-        });
-      }
     } catch (notifErr) {
       console.warn("[safety] notification insert", notifErr.message);
     }
