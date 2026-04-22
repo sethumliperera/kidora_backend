@@ -3,7 +3,7 @@ const router = express.Router();
 const db = require("../db");
 const verifyToken = require("../middleware/authMiddleware");
 
-const TABLE = "restrictions";
+const TABLE = "app_restrictions";
 
 const sameId = (a, b) => {
   const na = Number(a);
@@ -36,9 +36,10 @@ const safeDuration = (value) => {
 
 const normalizeRestrictionRow = (r) => ({
   ...r,
+  type: r.type ?? r.name,
+  enabled: !!(r.enabled ?? r.is_enabled),
   days: parseListField(r.days),
   blocked_apps: parseListField(r.blocked_apps),
-  enabled: !!r.enabled,
 });
 
 async function assertParentOwnsChild(childId, parentId) {
@@ -88,10 +89,9 @@ router.post("/", verifyToken, async (req, res) => {
     const duration = safeDuration(duration_minutes);
     const [result] = await db.query(
       `INSERT INTO ${TABLE}
-      (parent_id, child_id, type, start_time, end_time, days, blocked_apps, duration_minutes, activated_at, enabled)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      (child_id, name, start_time, end_time, days, blocked_apps, duration_minutes, activated_at, is_enabled)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
-        parent_id,
         child_id,
         type,
         start_time || null,
@@ -123,10 +123,10 @@ router.get("/", verifyToken, async (req, res) => {
     const parent_id = req.user.id;
 
     const [results] = await db.query(
-      `SELECT r.*, c.name AS child_name
+      `SELECT r.*, r.name AS type, r.is_enabled AS enabled, c.name AS child_name
        FROM ${TABLE} r
        JOIN children c ON r.child_id = c.id
-       WHERE r.parent_id = ?
+       WHERE c.parent_id = ?
        ORDER BY r.created_at DESC`,
       [parent_id]
     );
@@ -153,8 +153,10 @@ router.get("/child/:child_id", verifyToken, async (req, res) => {
     }
 
     const [results] = await db.query(
-      `SELECT * FROM ${TABLE}
-       WHERE child_id = ? AND parent_id = ?
+      `SELECT r.*, r.name AS type, r.is_enabled AS enabled
+       FROM ${TABLE} r
+       JOIN children c ON r.child_id = c.id
+       WHERE r.child_id = ? AND c.parent_id = ?
        ORDER BY created_at DESC`,
       [child_id, parent_id]
     );
@@ -176,7 +178,10 @@ router.put("/:id", verifyToken, async (req, res) => {
     const { id } = req.params;
 
     const [rows] = await db.query(
-      `SELECT parent_id FROM ${TABLE} WHERE id = ?`,
+      `SELECT c.parent_id
+       FROM ${TABLE} r
+       JOIN children c ON c.id = r.child_id
+       WHERE r.id = ?`,
       [id]
     );
 
@@ -201,14 +206,14 @@ router.put("/:id", verifyToken, async (req, res) => {
     const duration = safeDuration(duration_minutes);
     await db.query(
       `UPDATE ${TABLE} SET
-        type = ?,
+        name = ?,
         start_time = ?,
         end_time = ?,
         days = ?,
         blocked_apps = ?,
         duration_minutes = ?,
         activated_at = ?,
-        enabled = ?
+        is_enabled = ?
       WHERE id = ?`,
       [
         type,
@@ -240,7 +245,10 @@ router.patch("/:id/toggle", verifyToken, async (req, res) => {
     const { id } = req.params;
 
     const [rows] = await db.query(
-      `SELECT parent_id, enabled FROM ${TABLE} WHERE id = ?`,
+      `SELECT c.parent_id, r.is_enabled AS enabled
+       FROM ${TABLE} r
+       JOIN children c ON c.id = r.child_id
+       WHERE r.id = ?`,
       [id]
     );
 
@@ -254,7 +262,7 @@ router.patch("/:id/toggle", verifyToken, async (req, res) => {
 
     const newStatus = rows[0].enabled ? 0 : 1;
     await db.query(
-      `UPDATE ${TABLE} SET enabled = ?, activated_at = ? WHERE id = ?`,
+      `UPDATE ${TABLE} SET is_enabled = ?, activated_at = ? WHERE id = ?`,
       [newStatus, newStatus ? new Date() : null, id]
     );
 
@@ -278,7 +286,10 @@ router.delete("/:id", verifyToken, async (req, res) => {
     const { id } = req.params;
 
     const [rows] = await db.query(
-      `SELECT parent_id FROM ${TABLE} WHERE id = ?`,
+      `SELECT c.parent_id
+       FROM ${TABLE} r
+       JOIN children c ON c.id = r.child_id
+       WHERE r.id = ?`,
       [id]
     );
 
@@ -313,7 +324,9 @@ router.get("/active/:child_id", async (req, res) => {
     const yesterday = days[(now.getDay() + 6) % 7];
 
     const [rows] = await db.query(
-      `SELECT * FROM ${TABLE} WHERE child_id = ? AND enabled = 1`,
+      `SELECT *, name AS type, is_enabled AS enabled
+       FROM ${TABLE}
+       WHERE child_id = ? AND is_enabled = 1`,
       [child_id]
     );
 
