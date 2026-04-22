@@ -373,25 +373,8 @@ router.post("/presence", async (req, res) => {
 // ===============================
 router.post("/:id/usage", async (req, res) => {
   try {
-    const { app_name, additional_minutes, cumulative_seconds } = req.body;
+    const { app_name, additional_minutes } = req.body;
     const child_id = req.params.id;
-
-    // 🔥 NEW: idempotent mode — if the client sends `cumulative_seconds`
-    // we UPSERT a single row per (child, app, today-midnight). This keeps
-    // `SUM(duration_seconds)` accurate no matter how often the child
-    // pings, and survives app restarts.
-    if (cumulative_seconds !== undefined && cumulative_seconds !== null) {
-      const sec = Math.max(0, parseInt(cumulative_seconds, 10) || 0);
-      await db.query(
-        `INSERT INTO app_usage (child_id, app_name, start_time, end_time, duration_seconds)
-         VALUES (?, ?, CAST(CURDATE() AS DATETIME), NOW(), ?)
-         ON DUPLICATE KEY UPDATE
-           end_time = NOW(),
-           duration_seconds = VALUES(duration_seconds)`,
-        [child_id, app_name, sec]
-      );
-      return res.json({ message: "Recorded (cumulative)" });
-    }
 
     await db.query(
       `INSERT INTO app_controls (child_id, app_name, time_used)
@@ -407,23 +390,6 @@ router.post("/:id/usage", async (req, res) => {
     );
 
     res.json({ message: "Recorded" });
-  } catch (err) {
-    res.status(500).json({ message: err.message });
-  }
-});
-
-// 🧹 Cleanup — wipe today's rows for one child so the cumulative
-// uploader can start from a clean slate after the old delta logic left
-// extra rows behind. No auth so the child can run this once on boot too.
-router.post("/:id/usage/reset-today", async (req, res) => {
-  try {
-    const child_id = req.params.id;
-    await db.query(
-      `DELETE FROM app_usage
-       WHERE child_id = ? AND DATE(start_time) = CURDATE()`,
-      [child_id]
-    );
-    res.json({ message: "Today's usage cleared" });
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
