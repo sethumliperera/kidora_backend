@@ -331,36 +331,40 @@ router.get("/active/:child_id", async (req, res) => {
     );
 
     const activeRestrictions = rows.filter((r) => {
-      const duration = safeDuration(r.duration_minutes);
-      if (duration && r.activated_at) {
-        const activatedAt = new Date(r.activated_at);
-        if (!Number.isNaN(activatedAt.getTime())) {
-          const activeUntil = new Date(
-            activatedAt.getTime() + duration * 60 * 1000
+      const hasSchedule =
+        String(r.start_time || "").trim().length > 0 &&
+        String(r.end_time || "").trim().length > 0;
+
+      // Scheduled rules are activated ONLY when current day/time is inside the window.
+      if (hasSchedule) {
+        const start = parseTime(r.start_time);
+        const end = parseTime(r.end_time);
+        if (start === null || end === null) return false;
+
+        const restrictionDays = parseListField(r.days);
+        if (start <= end) {
+          return (
+            restrictionDays.includes(today) &&
+            currentMinutes >= start &&
+            currentMinutes <= end
           );
-          if (now <= activeUntil) return true;
         }
+
+        // Overnight window: e.g. 22:00 -> 06:00
+        const inLateWindow =
+          restrictionDays.includes(today) && currentMinutes >= start;
+        const inEarlyWindow =
+          restrictionDays.includes(yesterday) && currentMinutes <= end;
+        return inLateWindow || inEarlyWindow;
       }
 
-      if (!r.start_time || !r.end_time) return false;
-      const start = parseTime(r.start_time);
-      const end = parseTime(r.end_time);
-      if (start === null || end === null) return false;
-
-      const restrictionDays = parseListField(r.days);
-      if (start <= end) {
-        return (
-          restrictionDays.includes(today) &&
-          currentMinutes >= start &&
-          currentMinutes <= end
-        );
-      }
-
-      const inLateWindow =
-        restrictionDays.includes(today) && currentMinutes >= start;
-      const inEarlyWindow =
-        restrictionDays.includes(yesterday) && currentMinutes <= end;
-      return inLateWindow || inEarlyWindow;
+      // Duration-only rules (no start/end schedule)
+      const duration = safeDuration(r.duration_minutes);
+      if (!duration || !r.activated_at) return false;
+      const activatedAt = new Date(r.activated_at);
+      if (Number.isNaN(activatedAt.getTime())) return false;
+      const activeUntil = new Date(activatedAt.getTime() + duration * 60 * 1000);
+      return now <= activeUntil;
     });
 
     res.json(activeRestrictions.map(normalizeRestrictionRow));
