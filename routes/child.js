@@ -6,25 +6,6 @@ const multer = require("multer");
 const path = require("path");
 const crypto = require("crypto");
 
-let uninstallPinColumnChecked = false;
-const ensureUninstallPinColumn = async () => {
-  if (uninstallPinColumnChecked) return;
-  try {
-    await db.query(
-      "ALTER TABLE users ADD COLUMN uninstall_pin_hash VARCHAR(255) NULL"
-    );
-  } catch (err) {
-    if (!String(err.message || "").toLowerCase().includes("duplicate column")) {
-      throw err;
-    }
-  } finally {
-    uninstallPinColumnChecked = true;
-  }
-};
-
-const hashPin = (pin) =>
-  crypto.createHash("sha256").update(String(pin)).digest("hex");
-
 // ===============================
 //  MULTER CONFIG
 // ===============================
@@ -392,8 +373,25 @@ router.post("/presence", async (req, res) => {
 // ===============================
 router.post("/:id/usage", async (req, res) => {
   try {
-    const { app_name, additional_minutes } = req.body;
+    const { app_name, additional_minutes, cumulative_seconds } = req.body;
     const child_id = req.params.id;
+
+    // 🔥 NEW: idempotent mode — if the client sends `cumulative_seconds`
+    // we UPSERT a single row per (child, app, today-midnight). This keeps
+    // `SUM(duration_seconds)` accurate no matter how often the child
+    // pings, and survives app restarts.
+    if (cumulative_seconds !== undefined && cumulative_seconds !== null) {
+      const sec = Math.max(0, parseInt(cumulative_seconds, 10) || 0);
+      await db.query(
+        `INSERT INTO app_usage (child_id, app_name, start_time, end_time, duration_seconds)
+         VALUES (?, ?, CAST(CURDATE() AS DATETIME), NOW(), ?)
+         ON DUPLICATE KEY UPDATE
+           end_time = NOW(),
+           duration_seconds = VALUES(duration_seconds)`,
+        [child_id, app_name, sec]
+      );
+      return res.json({ message: "Recorded (cumulative)" });
+    }
 
     await db.query(
       `INSERT INTO app_controls (child_id, app_name, time_used)
@@ -409,6 +407,23 @@ router.post("/:id/usage", async (req, res) => {
     );
 
     res.json({ message: "Recorded" });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// 🧹 Cleanup — wipe today's rows for one child so the cumulative
+// uploader can start from a clean slate after the old delta logic left
+// extra rows behind. No auth so the child can run this once on boot too.
+router.post("/:id/usage/reset-today", async (req, res) => {
+  try {
+    const child_id = req.params.id;
+    await db.query(
+      `DELETE FROM app_usage
+       WHERE child_id = ? AND DATE(start_time) = CURDATE()`,
+      [child_id]
+    );
+    res.json({ message: "Today's usage cleared" });
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
@@ -441,116 +456,14 @@ router.post("/:id/reminders", async (req, res) => {
 //  FCM TOKEN
 // ===============================
 router.post("/save-fcm-token", async (req, res) => {
-  try {
-    const { child_id, child_public_id, fcm_token } = req.body;
-    if (!fcm_token || String(fcm_token).trim() === "") {
-      return res.status(400).json({ message: "fcm_token is required" });
-    }
+  const { child_id, fcm_token } = req.body;
 
-    let result;
-    if (child_id !== undefined && child_id !== null && String(child_id).trim() !== "") {
-      [result] = await db.query(
-        "UPDATE children SET fcm_token = ? WHERE id = ?",
-        [fcm_token, child_id]
-      );
-    } else if (
-      child_public_id !== undefined &&
-      child_public_id !== null &&
-      String(child_public_id).trim() !== ""
-    ) {
-      [result] = await db.query(
-        "UPDATE children SET fcm_token = ? WHERE child_id = ?",
-        [fcm_token, String(child_public_id).trim()]
-      );
-    } else {
-      return res.status(400).json({ message: "child_id or child_public_id is required" });
-    }
+  await db.query(
+    "UPDATE children SET fcm_token = ? WHERE id = ?",
+    [fcm_token, child_id]
+  );
 
-    if (!result || result.affectedRows === 0) {
-      return res.status(404).json({ message: "Child not found for token save" });
-    }
-
-    res.json({ message: "Saved" });
-  } catch (err) {
-    console.error("SAVE FCM TOKEN ERROR:", err);
-    res.status(500).json({ message: "Failed to save FCM token", error: err.message });
-  }
-});
-
-// ===============================
-//  VERIFY UNINSTALL PIN (CHILD SIDE)
-// ===============================
-router.post("/verify-uninstall-pin", async (req, res) => {
-  try {
-    await ensureUninstallPinColumn();
-    const { child_id, child_public_id, pin } = req.body;
-
-    if (!/^\d{4}$/.test(String(pin || "").trim())) {
-      return res.status(400).json({ message: "pin must be exactly 4 digits" });
-    }
-
-    let childRows = [];
-    if (child_id !== undefined && child_id !== null && String(child_id).trim() !== "") {
-      const [rowsById] = await db.query(
-        "SELECT id, parent_id FROM children WHERE id = ? LIMIT 1",
-        [child_id]
-      );
-      childRows = rowsById;
-    } else if (
-      child_public_id !== undefined &&
-      child_public_id !== null &&
-      String(child_public_id).trim() !== ""
-    ) {
-      const [rowsByPublicId] = await db.query(
-        "SELECT id, parent_id FROM children WHERE child_id = ? LIMIT 1",
-        [String(child_public_id).trim()]
-      );
-      childRows = rowsByPublicId;
-    } else {
-      return res.status(400).json({ message: "child_id or child_public_id is required" });
-    }
-
-    if (childRows.length === 0) {
-      return res.status(404).json({ message: "Child not found" });
-    }
-
-    const parentId = childRows[0].parent_id;
-    const [userRows] = await db.query(
-      "SELECT uninstall_pin_hash FROM users WHERE id = ? LIMIT 1",
-      [parentId]
-    );
-    if (userRows.length === 0 || !userRows[0].uninstall_pin_hash) {
-      return res.status(404).json({ message: "Parent uninstall PIN is not set" });
-    }
-
-    const submittedPin = String(pin).trim();
-    const storedRaw = String(userRows[0].uninstall_pin_hash || "").trim();
-    const storedLower = storedRaw.toLowerCase();
-
-    // Support legacy formats to avoid locking out existing users:
-    // 1) SHA-256 from older code paths that may have stripped leading zeros.
-    // 2) Plain 4-digit values accidentally stored before hashing was enforced.
-    const legacyNoLeadingZero = String(parseInt(submittedPin, 10));
-    const currentHash = hashPin(submittedPin).toLowerCase();
-    const legacyHash = hashPin(legacyNoLeadingZero).toLowerCase();
-
-    let valid = storedLower === currentHash || storedLower === legacyHash;
-
-    if (!valid && /^\d{4}$/.test(storedRaw)) {
-      valid = storedRaw === submittedPin;
-      if (valid) {
-        await db.query(
-          "UPDATE users SET uninstall_pin_hash = ? WHERE id = ?",
-          [currentHash, parentId]
-        );
-      }
-    }
-
-    return res.json({ valid });
-  } catch (err) {
-    console.error("VERIFY UNINSTALL PIN ERROR:", err);
-    res.status(500).json({ message: "Failed to verify uninstall PIN", error: err.message });
-  }
+  res.json({ message: "Saved" });
 });
 // ===============================
 // 📅 APP RESTRICTION SCHEDULES
