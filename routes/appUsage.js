@@ -84,6 +84,53 @@ router.get("/get-usage/:child_id", verifyToken, async (req, res) => {
   }
 });
 
+// RESET TODAY'S ROWS (parent reset) — keeps only the idempotent
+// start-of-day row if it exists, deletes all other rows for today so the
+// cumulative upserts from the child become the single source of truth.
+router.post("/reset-today/:child_id", verifyToken, async (req, res) => {
+  try {
+    const { child_id } = req.params;
+    // Delete all rows for today EXCEPT the canonical midnight-anchored row
+    // so the next cumulative upsert from the child creates/updates it.
+    await db.query(
+      `DELETE FROM app_usage
+       WHERE child_id = ?
+         AND DATE(start_time) = CURDATE()
+         AND start_time <> CAST(CURDATE() AS DATETIME)`,
+      [child_id]
+    );
+    res.json({ message: "Today's non-canonical rows cleared" });
+  } catch (err) {
+    console.error("Error resetting today's usage:", err);
+    res.status(500).json({ error: "Database error", details: err.message });
+  }
+});
+
+// RETURN RAW CANONICAL TODAY ROW (lets parent ignore polluted extras)
+router.get("/today-canonical/:child_id", verifyToken, async (req, res) => {
+  try {
+    const { child_id } = req.params;
+    const [rows] = await db.query(
+      `SELECT app_name, duration_seconds AS total_duration
+       FROM app_usage
+       WHERE child_id = ?
+         AND start_time = CAST(CURDATE() AS DATETIME)
+       ORDER BY duration_seconds DESC`,
+      [child_id]
+    );
+    let total = 0;
+    const apps = rows.map((r) => {
+      const d = parseInt(r.total_duration, 10) || 0;
+      total += d;
+      return { app_name: r.app_name, duration: d };
+    });
+    res.json({ total_screen_time: total, apps });
+  } catch (err) {
+    console.error("Error fetching canonical today usage:", err);
+    res.status(500).json({ error: "Database error", details: err.message });
+  }
+});
+
 // GET WEEKLY USAGE (Historical)
 router.get("/get-weekly-usage/:child_id", verifyToken, async (req, res) => {
   try {
