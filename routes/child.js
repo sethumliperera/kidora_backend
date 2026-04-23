@@ -457,11 +457,12 @@ router.post("/save-fcm-token", async (req, res) => {
 // ===============================
 
 // 1. GET ALL SCHEDULES (child app & parent; unauthenticated use for linked device)
+//    Table name matches Railway: app_restrictions (not app_restriction_schedules).
 router.get("/:id/schedules", async (req, res) => {
   try {
     const child_id = req.params.id;
     const [rows] = await db.query(
-      "SELECT * FROM app_restriction_schedules WHERE child_id = ?",
+      "SELECT * FROM app_restrictions WHERE child_id = ?",
       [child_id]
     );
 
@@ -497,9 +498,9 @@ router.post("/:id/schedules", verifyToken, async (req, res) => {
       return res.status(403).json({ message: "Unauthorized" });
     }
 
-    // Auto-create table if missing (consistent with child.js pattern)
+    // Create table if missing (aligns with Railway `app_restrictions` dashboard)
     await db.query(`
-      CREATE TABLE IF NOT EXISTS app_restriction_schedules (
+      CREATE TABLE IF NOT EXISTS app_restrictions (
         id INT AUTO_INCREMENT PRIMARY KEY,
         child_id INT NOT NULL,
         name VARCHAR(255) NOT NULL,
@@ -507,30 +508,31 @@ router.post("/:id/schedules", verifyToken, async (req, res) => {
         end_time VARCHAR(10) NOT NULL,
         days TEXT NOT NULL,
         blocked_apps TEXT NOT NULL,
+        duration_minutes INT NULL,
+        activated_at TIMESTAMP NULL,
         is_enabled TINYINT(1) DEFAULT 1,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-        FOREIGN KEY (child_id) REFERENCES children(id) ON DELETE CASCADE
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
       )
     `);
 
     const daysJson = JSON.stringify(days || []);
     const blockedAppsJson = JSON.stringify(blocked_packages || []);
     const enabled = is_enabled ? 1 : 0;
+    const idNum = id != null && id !== "" ? Number(id) : NaN;
+    const hasId = !Number.isNaN(idNum);
 
-    if (id && isNaN(id) === false) {
-      // Update existing
+    if (hasId) {
       await db.query(
-        `UPDATE app_restriction_schedules 
+        `UPDATE app_restrictions
          SET name = ?, start_time = ?, end_time = ?, days = ?, blocked_apps = ?, is_enabled = ?
          WHERE id = ? AND child_id = ?`,
-        [name, start_time, end_time, daysJson, blockedAppsJson, enabled, id, child_id]
+        [name, start_time, end_time, daysJson, blockedAppsJson, enabled, idNum, child_id]
       );
       res.json({ message: "Schedule updated successfully" });
     } else {
-      // Create new
       const [result] = await db.query(
-        `INSERT INTO app_restriction_schedules 
+        `INSERT INTO app_restrictions
          (child_id, name, start_time, end_time, days, blocked_apps, is_enabled)
          VALUES (?, ?, ?, ?, ?, ?, ?)`,
         [child_id, name, start_time, end_time, daysJson, blockedAppsJson, enabled]
@@ -556,7 +558,7 @@ router.delete("/:id/schedules/:scheduleId", verifyToken, async (req, res) => {
       return res.status(403).json({ message: "Unauthorized" });
     }
     const [result] = await db.query(
-      "DELETE FROM app_restriction_schedules WHERE id = ? AND child_id = ?",
+      "DELETE FROM app_restrictions WHERE id = ? AND child_id = ?",
       [scheduleId, id]
     );
 
