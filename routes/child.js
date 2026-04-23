@@ -456,21 +456,56 @@ router.post("/save-fcm-token", async (req, res) => {
 // 📅 APP RESTRICTION SCHEDULES
 // ===============================
 
+// Same as POST: GET must not fail with ER_NO_SUCH_TABLE before the parent has ever saved a schedule.
+async function ensureAppRestrictionsTable() {
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS app_restrictions (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      child_id INT NOT NULL,
+      name VARCHAR(255) NOT NULL,
+      start_time VARCHAR(10) NOT NULL,
+      end_time VARCHAR(10) NOT NULL,
+      days TEXT NOT NULL,
+      blocked_apps TEXT NOT NULL,
+      duration_minutes INT NULL,
+      activated_at TIMESTAMP NULL,
+      is_enabled TINYINT(1) DEFAULT 1,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    )
+  `);
+}
+
+/** MySQL may return JSON/TEXT as string or (mysql2) already-parsed array — JSON.parse only works on strings. */
+function jsonColumnToArray(val) {
+  if (val == null || val === "") return [];
+  if (Array.isArray(val)) return val;
+  if (typeof val === "string") {
+    try {
+      const p = JSON.parse(val);
+      return Array.isArray(p) ? p : [];
+    } catch {
+      return [];
+    }
+  }
+  return [];
+}
+
 // 1. GET ALL SCHEDULES (child app & parent; unauthenticated use for linked device)
 //    Table name matches Railway: app_restrictions (not app_restriction_schedules).
 router.get("/:id/schedules", async (req, res) => {
   try {
+    await ensureAppRestrictionsTable();
     const child_id = req.params.id;
     const [rows] = await db.query(
       "SELECT * FROM app_restrictions WHERE child_id = ?",
       [child_id]
     );
 
-    // Format for frontend (Parse JSON strings)
-    const formatted = rows.map(r => ({
+    const formatted = rows.map((r) => ({
       ...r,
-      days: JSON.parse(r.days || "[]"),
-      blocked_packages: JSON.parse(r.blocked_apps || "[]"),
+      days: jsonColumnToArray(r.days),
+      blocked_packages: jsonColumnToArray(r.blocked_apps),
       start_time: r.start_time,
       end_time: r.end_time,
       is_enabled: r.is_enabled === 1
@@ -498,23 +533,7 @@ router.post("/:id/schedules", verifyToken, async (req, res) => {
       return res.status(403).json({ message: "Unauthorized" });
     }
 
-    // Create table if missing (aligns with Railway `app_restrictions` dashboard)
-    await db.query(`
-      CREATE TABLE IF NOT EXISTS app_restrictions (
-        id INT AUTO_INCREMENT PRIMARY KEY,
-        child_id INT NOT NULL,
-        name VARCHAR(255) NOT NULL,
-        start_time VARCHAR(10) NOT NULL,
-        end_time VARCHAR(10) NOT NULL,
-        days TEXT NOT NULL,
-        blocked_apps TEXT NOT NULL,
-        duration_minutes INT NULL,
-        activated_at TIMESTAMP NULL,
-        is_enabled TINYINT(1) DEFAULT 1,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-      )
-    `);
+    await ensureAppRestrictionsTable();
 
     const daysJson = JSON.stringify(days || []);
     const blockedAppsJson = JSON.stringify(blocked_packages || []);
