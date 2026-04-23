@@ -47,6 +47,8 @@ const ensureInstalledAppsTable = async () => {
   `);
 };
 
+const { buildWeeklyInsights } = require("../weeklyInsightAnalysis");
+
 // One row per child + app + calendar day (start_time = local midnight) for history + dashboards
 const ensureAppUsageTable = async () => {
   await db.query(`
@@ -156,6 +158,81 @@ router.post("/save-usage", async (req, res) => {
     res.json({ message: "Usage saved successfully", date: day });
   } catch (err) {
     console.error("SAVE USAGE ERROR:", err);
+    res.status(500).json({ error: "Database error", details: err.message });
+  }
+});
+
+// ===============================
+// 📊 GET WEEKLY APP BREAKDOWN (last N days, default 7)
+// GET /api/screen-time/usage/:child_id/weekly-apps?days=7
+// Returns: { start_date, end_date, days, total_screen_time, total_app_sum_seconds, apps, insights }
+// ===============================
+router.get("/usage/:child_id/weekly-apps", async (req, res) => {
+  try {
+    await ensureTable();
+    await ensureTotalsTable();
+    await ensureInstalledAppsTable();
+
+    const cid = parseInt(String(req.params.child_id), 10);
+    if (!Number.isFinite(cid) || cid <= 0) {
+      return res.status(400).json({ error: "invalid child_id" });
+    }
+
+    const days = Math.min(30, Math.max(1, parseInt(String(req.query.days), 10) || 7));
+    const lookback = days - 1;
+
+    const [rows] = await db.query(
+      `SELECT d.app_name AS package_name,
+              MAX(COALESCE(i.app_name, d.app_name)) AS app_name,
+              SUM(d.duration_seconds) AS duration
+       FROM daily_screen_time d
+       LEFT JOIN installed_apps i
+         ON i.child_id = d.child_id AND i.package_name = d.app_name
+       WHERE d.child_id = ? AND d.date >= DATE_SUB(CURDATE(), INTERVAL ? DAY)
+       GROUP BY d.app_name
+       ORDER BY duration DESC`,
+      [cid, lookback]
+    );
+
+    const apps = rows.map((row) => ({
+      package_name: row.package_name,
+      app_name: row.app_name,
+      duration: parseInt(row.duration, 10) || 0
+    }));
+    const sumApps = apps.reduce((a, b) => a + b.duration, 0);
+    const [tRange] = await db.query(
+      `SELECT
+         DATE_SUB(CURDATE(), INTERVAL ? DAY) AS start_date,
+         CURDATE() AS end_date`,
+      [lookback]
+    );
+    const startD = tRange[0]?.start_date;
+    const endD = tRange[0]?.end_date;
+    const [totalsWeek] = await db.query(
+      `SELECT COALESCE(SUM(total_seconds), 0) AS t
+       FROM daily_screen_time_totals
+       WHERE child_id = ? AND date >= DATE_SUB(CURDATE(), INTERVAL ? DAY)`,
+      [cid, lookback]
+    );
+    const fromTotals = parseInt(totalsWeek[0]?.t, 10) || 0;
+    const total_screen_time = fromTotals > 0 ? fromTotals : sumApps;
+
+    const insights = buildWeeklyInsights(apps, total_screen_time);
+
+    res.json({
+      start_date: startD ? String(startD).slice(0, 10) : null,
+      end_date: endD ? String(endD).slice(0, 10) : null,
+      days,
+      total_screen_time,
+      total_app_sum_seconds: sumApps,
+      apps,
+      insights: {
+        concerns: insights.concerns,
+        positives: insights.positives
+      }
+    });
+  } catch (err) {
+    console.error("GET WEEKLY APPS ERROR:", err);
     res.status(500).json({ error: "Database error", details: err.message });
   }
 });
