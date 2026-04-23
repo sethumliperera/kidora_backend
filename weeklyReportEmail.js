@@ -1,5 +1,4 @@
 const db = require("./db");
-const PDFDocument = require("pdfkit");
 const { getTransporter, resolveSmtpUser } = require("./smtpEnv");
 const { buildWeeklyInsights } = require("./weeklyInsightAnalysis");
 
@@ -108,7 +107,18 @@ async function weeklyTotalSeconds(childId) {
   return parseInt(sumQ[0]?.s, 10) || 0;
 }
 
+/** Resolves to Buffer, or null if the optional `pdfkit` package is not installed. */
 function buildPdfBuffer(childName, parentEmail, apps, totalSec, insight) {
+  let PDFDocument;
+  try {
+    PDFDocument = require("pdfkit");
+  } catch (e) {
+    console.warn(
+      "[weeklyReport] pdfkit not available (add to package.json and run npm install):",
+      e.message
+    );
+    return Promise.resolve(null);
+  }
   return new Promise((resolve, reject) => {
     const doc = new PDFDocument({ size: "A4", margin: 50 });
     const chunks = [];
@@ -161,7 +171,7 @@ function buildPdfBuffer(childName, parentEmail, apps, totalSec, insight) {
   });
 }
 
-function buildHtmlBody(childName, apps, totalSec, insight) {
+function buildHtmlBody(childName, apps, totalSec, insight, pdfAttached) {
   const hours = (totalSec / 3600).toFixed(1);
   const appRows = apps
     .slice(0, 12)
@@ -202,7 +212,11 @@ function buildHtmlBody(childName, apps, totalSec, insight) {
     ${concernHtml || ""}
     <h3>Positive notes</h3>
     ${posHtml}
-    <p style="color:#888;font-size:12px;margin-top:24px">A PDF is attached for your records. You can also open <strong>Weekly insights</strong> in the app anytime.</p>
+    <p style="color:#888;font-size:12px;margin-top:24px">${
+      pdfAttached
+        ? "A PDF is attached for your records. You can also open <strong>Weekly insights</strong> in the app anytime."
+        : "PDF attachment is unavailable on the server (install the <code>pdfkit</code> npm package). The report above is complete in email form; open <strong>Weekly insights</strong> in the app for charts."
+    }</p>
   </div>`;
 }
 
@@ -267,20 +281,23 @@ async function sendWeeklyReportsForAllChildren() {
       const ins = buildWeeklyInsights(apps, total);
       const childName = row.child_name || "Child";
       const pdf = await buildPdfBuffer(childName, email, apps, total, ins);
-      const html = buildHtmlBody(childName, apps, total, ins);
+      const html = buildHtmlBody(childName, apps, total, ins, !!(pdf && pdf.length));
 
-      await transporter.sendMail({
+      const mail = {
         from: `"Kidora" <${from}>`,
         to: email,
         subject: `Kidora weekly report — ${childName} (${yw})`,
-        html,
-        attachments: [
+        html
+      };
+      if (pdf && pdf.length) {
+        mail.attachments = [
           {
             filename: `Kidora_Weekly_${childName.replace(/[^\w-]+/g, "_")}_${yw}.pdf`,
             content: pdf
           }
-        ]
-      });
+        ];
+      }
+      await transporter.sendMail(mail);
 
       await db.query("INSERT INTO weekly_insight_email_log (child_id, year_week) VALUES (?, ?)", [
         childId,
