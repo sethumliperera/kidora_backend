@@ -35,6 +35,7 @@ const server = http.createServer(app);
 // DB
 // ===============================
 const db = require("./db");
+const { sendReminderPush } = require("./fcmReminders");
 
 // ===============================
 // MIDDLEWARE
@@ -90,8 +91,16 @@ setInterval(async () => {
         priority: reminder.priority,
       };
 
-      // ✅ SEND TO CHILD VIA SOCKET
+      // ✅ SEND TO CHILD VIA SOCKET (only when app is online)
       io.to(`child_${reminder.child_id}`).emit("new_notification", payload);
+
+      // ✅ PUSH NOTIFICATION (works when app is closed / in background)
+      await sendReminderPush(db, reminder.child_id, {
+        id: reminder.id,
+        title: reminder.title,
+        message: reminder.message,
+        priority: reminder.priority,
+      });
 
       console.log(`📤 Sent reminder to child_${reminder.child_id}`);
 
