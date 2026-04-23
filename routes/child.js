@@ -456,7 +456,7 @@ router.post("/save-fcm-token", async (req, res) => {
 // 📅 APP RESTRICTION SCHEDULES
 // ===============================
 
-// 1. GET ALL SCHEDULES
+// 1. GET ALL SCHEDULES (child app & parent; unauthenticated use for linked device)
 router.get("/:id/schedules", async (req, res) => {
   try {
     const child_id = req.params.id;
@@ -482,11 +482,20 @@ router.get("/:id/schedules", async (req, res) => {
   }
 });
 
-// 2. CREATE or UPDATE SCHEDULE (Standardized POST)
-router.post("/:id/schedules", async (req, res) => {
+// 2. CREATE or UPDATE SCHEDULE (parent only)
+router.post("/:id/schedules", verifyToken, async (req, res) => {
   try {
+    const parent_id = req.user.id;
     const child_id = req.params.id;
     const { id, name, start_time, end_time, days, blocked_packages, is_enabled } = req.body;
+
+    const [own] = await db.query(
+      "SELECT id FROM children WHERE id = ? AND parent_id = ?",
+      [child_id, parent_id]
+    );
+    if (own.length === 0) {
+      return res.status(403).json({ message: "Unauthorized" });
+    }
 
     // Auto-create table if missing (consistent with child.js pattern)
     await db.query(`
@@ -534,10 +543,18 @@ router.post("/:id/schedules", async (req, res) => {
   }
 });
 
-// 3. DELETE SCHEDULE
-router.delete("/:id/schedules/:scheduleId", async (req, res) => {
+// 3. DELETE SCHEDULE (parent only)
+router.delete("/:id/schedules/:scheduleId", verifyToken, async (req, res) => {
   try {
+    const parent_id = req.user.id;
     const { id, scheduleId } = req.params;
+    const [own] = await db.query(
+      "SELECT id FROM children WHERE id = ? AND parent_id = ?",
+      [id, parent_id]
+    );
+    if (own.length === 0) {
+      return res.status(403).json({ message: "Unauthorized" });
+    }
     const [result] = await db.query(
       "DELETE FROM app_restriction_schedules WHERE id = ? AND child_id = ?",
       [scheduleId, id]
