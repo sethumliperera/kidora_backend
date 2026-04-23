@@ -2,6 +2,7 @@ const express = require("express");
 const router = express.Router();
 const db = require("../db");
 const verifyToken = require("../middleware/authMiddleware");
+const { sendReminderPush } = require("../fcmReminders");
 
 // ===============================
 // 📤 SEND REMINDER (PARENT → CHILD)
@@ -49,24 +50,14 @@ router.post("/send", verifyToken, async (req, res) => {
 
     // 3. SOCKET EMIT
     const io = req.app.get("io");
-    const sendToChild = req.app.get("sendToChild");
 
-    const hasScheduledAt =
-      scheduled_at !== null &&
-      scheduled_at !== undefined &&
-      String(scheduled_at).trim() !== "";
+    const isImmediate =
+      !scheduled_at ||
+      new Date(scheduled_at).getTime() <= Date.now() + 5000;
 
-    const parsedScheduledAt = hasScheduledAt ? new Date(scheduled_at) : null;
-    if (hasScheduledAt && Number.isNaN(parsedScheduledAt?.getTime())) {
-      return res.status(400).json({ message: "Invalid scheduled_at timestamp" });
-    }
+    const room = `child_${child_id}`;
 
-    // Strict scheduling behavior:
-    // If a schedule is provided, do not emit immediately from this route.
-    // Let server.js scheduler deliver at due time.
-    const isImmediate = !hasScheduledAt;
-
-    console.log("📡 Target child ref:", child_id);
+    console.log("📡 Target room:", room);
 
     if (io && isImmediate) {
       const payload = {
@@ -79,11 +70,14 @@ router.post("/send", verifyToken, async (req, res) => {
 
       console.log("📤 Emitting reminder:", payload);
 
-      if (typeof sendToChild === "function") {
-        await sendToChild(child_id, "new_notification", payload);
-      } else {
-        io.to(`child_${child_id}`).emit("new_notification", payload);
-      }
+      io.to(room).emit("reminder", payload);
+
+      await sendReminderPush(db, child_id, {
+        id: reminder_id,
+        title,
+        message,
+        priority,
+      });
 
       await db.query(
         "UPDATE reminders SET is_sent = 1, sent_at = NOW() WHERE id = ?",
@@ -93,8 +87,24 @@ router.post("/send", verifyToken, async (req, res) => {
       console.log("⏳ Not emitted (scheduled or io missing)");
     }
 
-    // 4. Scheduling is handled centrally in server.js (is_sent poller).
-    // Do not schedule here to avoid duplicate/competing schedulers.
+    // 4. OPTIONAL SCHEDULER
+    try {
+      const scheduler = require("../scheduler");
+
+      if (frequency !== "once" || !isImmediate) {
+        scheduler.scheduleReminder({
+          id: reminder_id,
+          child_id,
+          title,
+          message,
+          priority,
+          scheduled_at,
+          frequency
+        });
+      }
+    } catch (err) {
+      console.log("⚠ Scheduler not active:", err.message);
+    }
 
     return res.json({
       message: isImmediate ? "Reminder sent" : "Reminder scheduled",
@@ -204,7 +214,7 @@ router.delete("/:id", verifyToken, async (req, res) => {
 
     if (!rows.length) return res.status(404).json({ message: "Not found" });
 
-    if (Number(rows[0].parent_id) !== Number(parent_id)) {
+    if (rows[0].parent_id !== parent_id) {
       return res.status(403).json({ message: "Unauthorized" });
     }
 
