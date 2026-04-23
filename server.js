@@ -17,6 +17,9 @@ console.log(
 const { logSmtpStartup } = require("./smtpEnv");
 logSmtpStartup();
 
+const { startWeeklyReportJob } = require("./weeklyReportEmail");
+startWeeklyReportJob();
+
 // ===============================
 // IMPORTS
 // ===============================
