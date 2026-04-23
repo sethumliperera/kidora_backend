@@ -422,12 +422,33 @@ router.post("/:id/reminders", async (req, res) => {
 //  FCM TOKEN
 // ===============================
 router.post("/save-fcm-token", async (req, res) => {
-  const { child_id, fcm_token } = req.body;
+  const { child_id, child_public_id, fcm_token } = req.body;
 
-  await db.query(
-    "UPDATE children SET fcm_token = ? WHERE id = ?",
-    [fcm_token, child_id]
-  );
+  if (!fcm_token) {
+    return res.status(400).json({ message: "fcm_token is required" });
+  }
+
+  let dbChildId =
+    child_id != null && child_id !== "" ? parseInt(String(child_id), 10) : null;
+  if (dbChildId != null && Number.isNaN(dbChildId)) dbChildId = null;
+  if (!dbChildId && child_public_id) {
+    const [rows] = await db.query(
+      "SELECT id FROM children WHERE child_id = ? LIMIT 1",
+      [String(child_public_id).trim()]
+    );
+    if (rows.length) dbChildId = rows[0].id;
+  }
+
+  if (!dbChildId) {
+    return res
+      .status(400)
+      .json({ message: "child_id or child_public_id is required to save FCM token" });
+  }
+
+  await db.query("UPDATE children SET fcm_token = ? WHERE id = ?", [
+    fcm_token,
+    dbChildId,
+  ]);
 
   res.json({ message: "Saved" });
 });
