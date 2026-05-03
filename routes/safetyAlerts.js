@@ -14,6 +14,7 @@ const DEFAULT_BLOCKED_PHRASES = [
   "escort",
   "onlyfans",
   "hentai",
+  "drugs",
   "cocaine",
   "heroin",
   "meth",
