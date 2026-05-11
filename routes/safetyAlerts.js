@@ -280,41 +280,77 @@ async function sendParentEmail(to, subject, html) {
   }
 
   const prefer = (process.env.EMAIL_PROVIDER || "auto").toLowerCase().trim();
-  const smtpFirst = prefer === "smtp" || prefer === "gmail";
 
-  if (smtpFirst) {
+  async function attemptSmtp() {
     const smtp = await sendViaConfiguredSmtp(recipient, subject, html);
     if (!smtp.skipped) {
-      console.log("[safety] email sent via SMTP to", recipient, smtp.messageId || "");
-      return smtp;
+      return { skipped: false, via: smtp.via || "smtp", messageId: smtp.messageId };
     }
-    console.warn("[safety] EMAIL_PROVIDER=gmail/smtp but SMTP send skipped:", smtp.reason);
     return { skipped: true, reason: smtp.reason || "smtp_not_configured" };
   }
 
-  if (process.env.RESEND_API_KEY) {
+  async function attemptResend() {
+    if (!process.env.RESEND_API_KEY?.trim()) {
+      return { skipped: true, reason: "no_resend_api_key" };
+    }
     await sendViaResend(recipient, subject, html);
-    console.log("[safety] email sent via Resend to", recipient);
     return { skipped: false, via: "resend" };
   }
 
-  if (process.env.SENDGRID_API_KEY) {
+  async function attemptSendGrid() {
+    if (!process.env.SENDGRID_API_KEY) {
+      return { skipped: true, reason: "no_sendgrid_api_key" };
+    }
     await sendViaSendGrid(recipient, subject, html);
-    console.log("[safety] email sent via SendGrid to", recipient);
     return { skipped: false, via: "sendgrid" };
   }
 
-  const smtp = await sendViaConfiguredSmtp(recipient, subject, html);
-  if (!smtp.skipped) {
-    console.log("[safety] email sent via SMTP to", recipient, smtp.messageId || "");
-    return smtp;
+  /**
+   * Try transports in order until one succeeds. Previously EMAIL_PROVIDER=gmail
+   * returned immediately when SMTP was misconfigured, never trying Resend/SendGrid.
+   */
+  async function tryChain(fns) {
+    const errors = [];
+    for (const fn of fns) {
+      try {
+        const r = await fn();
+        if (r && !r.skipped) {
+          console.log(
+            `[safety] email sent (${r.via}) to`,
+            recipient,
+            r.messageId || ""
+          );
+          return r;
+        }
+        if (r?.reason) errors.push(r.reason);
+      } catch (e) {
+        const msg = e?.message || String(e);
+        console.warn("[safety] mail transport error:", msg.slice(0, 300));
+        errors.push(msg.slice(0, 160));
+      }
+    }
+    console.warn(
+      "[safety] all mail transports failed or unconfigured for",
+      recipient,
+      errors.join(" | ").slice(0, 400)
+    );
+    return {
+      skipped: true,
+      reason: errors.length ? errors.join(" | ").slice(0, 500) : "no_mailer_config",
+    };
   }
 
-  console.warn(
-    "[safety] No mail transport: set EMAIL_PROVIDER=gmail + SMTP_* for kidoraapp06@gmail.com (or RESEND_API_KEY / SENDGRID_API_KEY). Parent:",
-    recipient
-  );
-  return { skipped: true, reason: "no_mailer_config" };
+  if (prefer === "smtp" || prefer === "gmail") {
+    return tryChain([attemptSmtp, attemptResend, attemptSendGrid]);
+  }
+  if (prefer === "resend") {
+    return tryChain([attemptResend, attemptSendGrid, attemptSmtp]);
+  }
+  if (prefer === "sendgrid") {
+    return tryChain([attemptSendGrid, attemptResend, attemptSmtp]);
+  }
+
+  return tryChain([attemptResend, attemptSendGrid, attemptSmtp]);
 }
 
 // GET /api/safety/ping — verify DB + mail config (no auth; for deploy checks only)
