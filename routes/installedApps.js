@@ -2,6 +2,7 @@ const express = require("express");
 const router = express.Router();
 const db = require("../db");
 const verifyToken = require("../middleware/authMiddleware");
+const { sendParentNotificationPush } = require("../fcmReminders");
 
 // Auto-create table helper
 async function ensureTable() {
@@ -34,7 +35,7 @@ router.post("/", async (req, res) => {
     }
 
     const [childRows] = await db.query(
-      "SELECT id, parent_id FROM children WHERE id = ?",
+      "SELECT id, parent_id, name FROM children WHERE id = ?",
       [numericChildId]
     );
     if (childRows.length === 0) {
@@ -42,6 +43,7 @@ router.post("/", async (req, res) => {
     }
 
     const parentId = childRows[0].parent_id;
+    const childName = childRows[0].name || "Your child";
 
     // ── Step 1: Remember existing package names (for new-install detection) ──
     const [existingRows] = await db.query(
@@ -100,6 +102,19 @@ router.post("/", async (req, res) => {
           console.error("Failed to create notification:", e.message);
         }
       }
+
+      const first = newApps[0];
+      const firstLabel = first ? first.app_name || first.package_name : "";
+      const pushBody =
+        newApps.length === 1
+          ? `${childName} installed ${firstLabel}`
+          : `${childName}: ${newApps.length} new apps (e.g. ${firstLabel})`;
+      await sendParentNotificationPush(db, parentId, {
+        title: "Kidora — new app",
+        body: pushBody,
+        type: "new_app_installed",
+        childId: numericChildId,
+      });
     }
 
     // ── Step 4: Clear old apps and re-insert ──
