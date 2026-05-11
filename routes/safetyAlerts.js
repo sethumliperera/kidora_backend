@@ -1,6 +1,7 @@
 const express = require("express");
 const router = express.Router();
 const db = require("../db");
+const firebaseAdmin = require("../firebaseAdmin");
 const { sendParentNotificationPush } = require("../fcmReminders");
 const { resolveSmtpUser, getTransporter, getSmtpPingDiagnostics } = require("../smtpEnv");
 
@@ -245,6 +246,51 @@ function normalizeParentEmail(raw) {
   return s;
 }
 
+/**
+ * MySQL `users.email` is often empty for Google-sign-in parents who never hit POST /users.
+ * Firebase Auth is the source of truth; we persist back to MySQL for the next alert.
+ *
+ * @param {{ parent_id: number, parent_email?: string|null, parent_firebase_uid?: string|null }} row
+ */
+async function resolveParentRecipientEmail(row) {
+  const parentId = row.parent_id;
+  const fromDb = normalizeParentEmail(row.parent_email);
+  if (fromDb) {
+    return { email: fromDb, source: "mysql" };
+  }
+
+  const uid = row.parent_firebase_uid ? String(row.parent_firebase_uid).trim() : "";
+  if (!uid) {
+    return {
+      email: null,
+      source: "none",
+      detail: "users.email_empty_and_no_firebase_uid",
+    };
+  }
+
+  try {
+    const rec = await firebaseAdmin.auth().getUser(uid);
+    const fromFb = normalizeParentEmail(rec.email);
+    if (!fromFb) {
+      return { email: null, source: "none", detail: "firebase_user_has_no_email" };
+    }
+    try {
+      await db.query("UPDATE users SET email = ? WHERE id = ?", [fromFb, parentId]);
+    } catch (persistErr) {
+      console.warn("[safety] could not persist Firebase email to users:", persistErr?.message);
+    }
+    return { email: fromFb, source: "firebase" };
+  } catch (e) {
+    const code = e?.code || e?.errorInfo?.code;
+    console.warn("[safety] Firebase auth().getUser failed:", code || e?.message);
+    return {
+      email: null,
+      source: "none",
+      detail: String(code || e?.message || "firebase_getUser_failed").slice(0, 160),
+    };
+  }
+}
+
 /** Gmail / SMTP: From address is SMTP_FROM (or SMTP_USER). Parents see "Kidora <kidoraapp06@gmail.com>" when using defaults. */
 async function sendViaConfiguredSmtp(to, subject, html) {
   const tx = getTransporter();
@@ -350,7 +396,18 @@ async function sendParentEmail(to, subject, html) {
     return tryChain([attemptSendGrid, attemptResend, attemptSmtp]);
   }
 
-  return tryChain([attemptResend, attemptSendGrid, attemptSmtp]);
+  // auto: prefer SMTP when credentials exist — Resend "onboarding@resend.dev" cannot deliver
+  // to arbitrary parent inboxes; Gmail/SMTP sends to the real parent address.
+  let smtpReady = false;
+  try {
+    smtpReady = !!getSmtpPingDiagnostics().smtp_ready;
+  } catch (_e) {
+    smtpReady = false;
+  }
+  const fns = smtpReady
+    ? [attemptSmtp, attemptResend, attemptSendGrid]
+    : [attemptResend, attemptSendGrid, attemptSmtp];
+  return tryChain(fns);
 }
 
 // GET /api/safety/ping — verify DB + mail config (no auth; for deploy checks only)
@@ -362,6 +419,9 @@ router.get("/ping", async (_req, res) => {
       ok: true,
       db: true,
       ...mail,
+      resend_api_key_set: !!String(process.env.RESEND_API_KEY || "").trim(),
+      sendgrid_api_key_set: !!String(process.env.SENDGRID_API_KEY || "").trim(),
+      email_provider: String(process.env.EMAIL_PROVIDER || "auto").trim() || "auto",
     });
   } catch (err) {
     console.error("[safety] ping", err);
@@ -413,7 +473,7 @@ router.post("/report-flagged-search", async (req, res) => {
     }
 
     const [rows] = await db.query(
-      `SELECT c.id, c.name, c.parent_id, u.email AS parent_email
+      `SELECT c.id, c.name, c.parent_id, u.email AS parent_email, u.firebase_uid AS parent_firebase_uid
        FROM children c
        JOIN users u ON u.id = c.parent_id
        WHERE c.id = ?`,
@@ -433,10 +493,17 @@ router.post("/report-flagged-search", async (req, res) => {
       });
     }
 
-    const { name: childName, parent_email: parentEmail } = rows[0];
-    const parentEmailNorm = normalizeParentEmail(parentEmail);
+    const childName = rows[0].name;
+    const resolvedRecipient = await resolveParentRecipientEmail(rows[0]);
+    const parentEmailNorm = resolvedRecipient.email;
     if (!parentEmailNorm) {
-      return res.status(400).json({ ok: false, error: "parent email missing or invalid" });
+      return res.status(400).json({
+        ok: false,
+        error: "parent email missing or invalid",
+        hint:
+          "Open the parent Kidora app once while signed in (syncs email), or ensure Firebase Auth has an email on this parent account. Service account project must match Firebase Auth.",
+        detail: resolvedRecipient.detail,
+      });
     }
 
     const [recent] = await db.query(
@@ -525,6 +592,7 @@ router.post("/report-flagged-search", async (req, res) => {
       logged: true,
       email_sent: emailSent,
       email_error: emailError,
+      parent_email_source: resolvedRecipient.source,
       parent_email_masked: (() => {
         const [loc, dom] = parentEmailNorm.split("@");
         if (!dom) return "***";
