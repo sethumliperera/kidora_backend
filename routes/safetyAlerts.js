@@ -59,6 +59,22 @@ function queryMatchesBlocklist(normalized) {
   return phrases.some((p) => p.length >= 2 && normalized.includes(p));
 }
 
+/**
+ * Accept if the full query matches the server blocklist, or the child device
+ * sends matched_keyword (phrase from its list) that the server also lists and
+ * that appears inside the normalized query (prevents arbitrary keyword injection).
+ */
+function serverAcceptsFlaggedSearch(normalized, body) {
+  if (queryMatchesBlocklist(normalized)) return true;
+  const mkRaw =
+    body && typeof body.matched_keyword === "string" ? body.matched_keyword : "";
+  const mk = normalizeQuery(mkRaw);
+  if (!mk || mk.length < 2) return false;
+  if (!normalized.includes(mk)) return false;
+  const phrases = loadBlockedPhrases();
+  return phrases.some((p) => p.length >= 2 && normalizeQuery(p) === mk);
+}
+
 function escapeHtml(s) {
   return String(s || "")
     .replace(/&/g, "&amp;")
@@ -506,7 +522,7 @@ router.post("/report-flagged-search", async (req, res) => {
       return res.status(400).json({ ok: false, error: "query required" });
     }
 
-    if (!queryMatchesBlocklist(normalized)) {
+    if (!serverAcceptsFlaggedSearch(normalized, req.body)) {
       console.warn("[safety] reject: not in blocklist", {
         childId,
         preview: `${normalized.slice(0, 60)}${normalized.length > 60 ? "…" : ""}`,
@@ -545,11 +561,8 @@ router.post("/report-flagged-search", async (req, res) => {
     const resolvedRecipient = await resolveParentRecipientEmail(rows[0]);
     const parentEmailNorm = resolvedRecipient.email;
     if (!parentEmailNorm) {
-      return res.status(400).json({
-        ok: false,
-        error: "parent email missing or invalid",
-        hint:
-          "Open the parent Kidora app once while signed in (syncs email), or ensure Firebase Auth has an email on this parent account. Service account project must match Firebase Auth.",
+      console.warn("[safety] parent email missing — still logging + push", {
+        childId,
         detail: resolvedRecipient.detail,
       });
     }
@@ -577,40 +590,44 @@ router.post("/report-flagged-search", async (req, res) => {
         : "";
     const serverReceivedUtc = new Date().toISOString();
 
-    const html = buildFlaggedSearchEmailHtml({
-      childName: labelForParent,
-      query: query.slice(0, 500),
-      sourcePackage,
-      deviceLocalDate,
-      deviceLocalTime,
-      deviceTimezone,
-      serverReceivedUtc,
-    });
-
-    const plain = buildFlaggedSearchEmailPlain({
-      childName: labelForParent,
-      query: query.slice(0, 500),
-      sourcePackage,
-      deviceLocalDate,
-      deviceLocalTime,
-      deviceTimezone,
-      serverReceivedUtc,
-    });
-
     const kw = query.length > 42 ? `${query.slice(0, 42)}…` : query;
     const subject = `[URGENT] Kidora: "${kw}" — ${labelForParent}`;
 
     let emailSent = false;
     let emailError = null;
-    try {
-      const mailResult = await sendParentEmail(parentEmailNorm, subject, html, plain);
-      emailSent = !mailResult.skipped;
-      if (mailResult.skipped) {
-        emailError = mailResult.reason || "skipped";
+    if (parentEmailNorm) {
+      const html = buildFlaggedSearchEmailHtml({
+        childName: labelForParent,
+        query: query.slice(0, 500),
+        sourcePackage,
+        deviceLocalDate,
+        deviceLocalTime,
+        deviceTimezone,
+        serverReceivedUtc,
+      });
+
+      const plain = buildFlaggedSearchEmailPlain({
+        childName: labelForParent,
+        query: query.slice(0, 500),
+        sourcePackage,
+        deviceLocalDate,
+        deviceLocalTime,
+        deviceTimezone,
+        serverReceivedUtc,
+      });
+
+      try {
+        const mailResult = await sendParentEmail(parentEmailNorm, subject, html, plain);
+        emailSent = !mailResult.skipped;
+        if (mailResult.skipped) {
+          emailError = mailResult.reason || "skipped";
+        }
+      } catch (mailErr) {
+        console.error("[safety] send mail error", mailErr?.message || mailErr);
+        emailError = String(mailErr?.message || "email_failed").slice(0, 200);
       }
-    } catch (mailErr) {
-      console.error("[safety] send mail error", mailErr?.message || mailErr);
-      emailError = String(mailErr?.message || "email_failed").slice(0, 200);
+    } else {
+      emailError = resolvedRecipient.detail || "no_parent_email";
     }
 
     await db.query(
@@ -633,15 +650,25 @@ router.post("/report-flagged-search", async (req, res) => {
       console.warn("[safety] notification insert", notifErr.message);
     }
 
+    const queryPush =
+      query.length > 120 ? `${query.slice(0, 120)}…` : query;
+    const pushBody = `${labelForParent} searched: "${queryPush}" — open Kidora.`.slice(
+      0,
+      2000
+    );
+
+    let pushResult = { sent: false, skipped: "not_attempted" };
     try {
-      await sendParentNotificationPush(db, rows[0].parent_id, {
+      pushResult = await sendParentNotificationPush(db, rows[0].parent_id, {
         title: "Kidora — safety alert",
-        body: `${labelForParent}: flagged search detected. Open Kidora for details.`,
+        body: pushBody,
         type: "safety_search",
         childId,
+        query: query.slice(0, 300),
       });
     } catch (pushErr) {
       console.warn("[safety] parent FCM", pushErr?.message || pushErr);
+      pushResult = { sent: false, error: String(pushErr?.message || pushErr).slice(0, 400) };
     }
 
     return res.json({
@@ -649,12 +676,18 @@ router.post("/report-flagged-search", async (req, res) => {
       logged: true,
       email_sent: emailSent,
       email_error: emailError,
+      email_skipped: !parentEmailNorm,
       parent_email_source: resolvedRecipient.source,
-      parent_email_masked: (() => {
-        const [loc, dom] = parentEmailNorm.split("@");
-        if (!dom) return "***";
-        return `${(loc || "?").slice(0, 1)}***@${dom}`;
-      })(),
+      parent_email_masked: parentEmailNorm
+        ? (() => {
+            const [loc, dom] = parentEmailNorm.split("@");
+            if (!dom) return "***";
+            return `${(loc || "?").slice(0, 1)}***@${dom}`;
+          })()
+        : null,
+      push_sent: !!pushResult.sent,
+      push_skipped: pushResult.skipped || null,
+      push_error: pushResult.error || null,
     });
   } catch (err) {
     console.error("[safety] report-flagged-search", err);
