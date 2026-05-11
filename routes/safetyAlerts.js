@@ -473,9 +473,22 @@ router.get("/ping", async (_req, res) => {
   try {
     await db.query("SELECT 1 AS ok");
     const mail = getSmtpPingDiagnostics();
+    let safety_stats = null;
+    try {
+      const [sx] = await db.query(
+        "SELECT MAX(id) AS last_id, COUNT(*) AS total FROM safety_search_alerts"
+      );
+      safety_stats = {
+        safety_search_alerts_last_id: sx[0]?.last_id ?? null,
+        safety_search_alerts_total: Number(sx[0]?.total ?? 0),
+      };
+    } catch (e) {
+      safety_stats = { error: String(e?.message || e).slice(0, 200) };
+    }
     return res.json({
       ok: true,
       db: true,
+      ...safety_stats,
       ...mail,
       resend_api_key_set: !!String(process.env.RESEND_API_KEY || "").trim(),
       sendgrid_api_key_set: !!String(process.env.SENDGRID_API_KEY || "").trim(),
@@ -558,12 +571,21 @@ router.post("/report-flagged-search", async (req, res) => {
         : null;
     const labelForParent = (displayName && displayName.trim()) || childName || "Your child";
 
-    const resolvedRecipient = await resolveParentRecipientEmail(rows[0]);
-    const parentEmailNorm = resolvedRecipient.email;
-    if (!parentEmailNorm) {
-      console.warn("[safety] parent email missing — still logging + push", {
-        childId,
-        detail: resolvedRecipient.detail,
+    const [dupRecent] = await db.query(
+      `SELECT query_text FROM safety_search_alerts
+       WHERE child_id = ? AND created_at > DATE_SUB(NOW(), INTERVAL 3 MINUTE)
+       ORDER BY id DESC LIMIT 80`,
+      [childId]
+    );
+    const isDup =
+      Array.isArray(dupRecent) &&
+      dupRecent.some((row) => normalizeQuery(row.query_text) === normalized);
+    if (isDup) {
+      return res.json({
+        ok: true,
+        logged: false,
+        deduped: true,
+        message: "same query recently; skip insert and notifications",
       });
     }
 
@@ -572,8 +594,27 @@ router.post("/report-flagged-search", async (req, res) => {
       [childId]
     );
     const n = recent[0]?.n ?? 0;
-    if (n >= 12) {
-      return res.status(429).json({ ok: false, error: "rate_limited" });
+    const hourlyCap = Math.max(12, parseInt(process.env.SAFETY_ALERTS_PER_CHILD_HOUR || "60", 10) || 60);
+    if (n >= hourlyCap) {
+      console.warn("[safety] rate_limited", { childId, n, hourlyCap });
+      return res.status(429).json({ ok: false, error: "rate_limited", hourly_cap: hourlyCap });
+    }
+
+    const [insertResult] = await db.query(
+      `INSERT INTO safety_search_alerts (child_id, query_text, source_package) VALUES (?, ?, ?)`,
+      [childId, query.slice(0, 2000), sourcePackage.slice(0, 255)]
+    );
+    const alertId = insertResult?.insertId ?? null;
+    console.log("[safety] INSERT safety_search_alerts ok (before email)", { childId, alertId });
+
+    const resolvedRecipient = await resolveParentRecipientEmail(rows[0]);
+    const parentEmailNorm = resolvedRecipient.email;
+    if (!parentEmailNorm) {
+      console.warn("[safety] parent email missing — row saved; push still attempted", {
+        childId,
+        alertId,
+        detail: resolvedRecipient.detail,
+      });
     }
 
     const deviceLocalDate =
@@ -630,12 +671,6 @@ router.post("/report-flagged-search", async (req, res) => {
       emailError = resolvedRecipient.detail || "no_parent_email";
     }
 
-    await db.query(
-      `INSERT INTO safety_search_alerts (child_id, query_text, source_package) VALUES (?, ?, ?)`,
-      [childId, query.slice(0, 2000), sourcePackage.slice(0, 255)]
-    );
-    console.log("[safety] INSERT safety_search_alerts ok", { childId, email_sent: emailSent });
-
     try {
       await db.query(
         `INSERT INTO notifications (parent_id, child_id, message, type) VALUES (?, ?, ?, ?)`,
@@ -674,6 +709,7 @@ router.post("/report-flagged-search", async (req, res) => {
     return res.json({
       ok: true,
       logged: true,
+      alert_id: alertId,
       email_sent: emailSent,
       email_error: emailError,
       email_skipped: !parentEmailNorm,
