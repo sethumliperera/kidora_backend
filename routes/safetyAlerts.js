@@ -159,16 +159,58 @@ function buildFlaggedSearchEmailHtml({
 </body></html>`;
 }
 
+/** Plain-text body for clients that hide HTML or for inbox previews. */
+function buildFlaggedSearchEmailPlain({
+  childName,
+  query,
+  sourcePackage,
+  deviceLocalDate,
+  deviceLocalTime,
+  deviceTimezone,
+  serverReceivedUtc,
+}) {
+  const child = childName || "Your child";
+  const q = String(query || "").slice(0, 500);
+  const pkg = sourcePackage || "unknown app/browser";
+  return [
+    "KIDORA — URGENT: flagged search",
+    "",
+    `Child: ${child}`,
+    `What they searched: ${q}`,
+    `App / browser (package): ${pkg}`,
+    `Device date: ${deviceLocalDate || "—"}`,
+    `Device time: ${deviceLocalTime || "—"}`,
+    `Time zone: ${deviceTimezone || "—"}`,
+    `Server received (UTC): ${serverReceivedUtc || new Date().toISOString()}`,
+    "",
+    "Open the Kidora parent app on your phone for more context.",
+  ].join("\n");
+}
+
 /**
  * Resend — optional alternative to Gmail SMTP (https://resend.com).
  * Only used if RESEND_API_KEY is set and EMAIL_PROVIDER != gmail/smtp.
  */
-async function sendViaResend(to, subject, html) {
+async function sendViaResend(to, subject, html, textPlain) {
   const key = process.env.RESEND_API_KEY?.trim();
   const from =
     process.env.RESEND_FROM?.trim() ||
     "Kidora <onboarding@resend.dev>";
   if (!key) throw new Error("RESEND_API_KEY missing");
+
+  const payload = {
+    from,
+    to: [to],
+    subject,
+    html,
+    headers: {
+      "X-Priority": "1",
+      Importance: "high",
+    },
+  };
+  if (textPlain && String(textPlain).trim()) {
+    payload.text = String(textPlain);
+  }
 
   const res = await fetch("https://api.resend.com/emails", {
     method: "POST",
@@ -176,16 +218,7 @@ async function sendViaResend(to, subject, html) {
       Authorization: `Bearer ${key}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({
-      from,
-      to: [to],
-      subject,
-      html,
-      headers: {
-        "X-Priority": "1",
-        Importance: "high",
-      },
-    }),
+    body: JSON.stringify(payload),
   });
 
   if (!res.ok) {
@@ -197,7 +230,7 @@ async function sendViaResend(to, subject, html) {
 /**
  * SendGrid Web API. Free tier ~100 emails/day for new accounts.
  */
-async function sendViaSendGrid(to, subject, html) {
+async function sendViaSendGrid(to, subject, html, textPlain) {
   const key = process.env.SENDGRID_API_KEY;
   const fromEmail =
     process.env.SENDGRID_FROM_EMAIL?.trim() ||
@@ -206,6 +239,11 @@ async function sendViaSendGrid(to, subject, html) {
   if (!key) throw new Error("SENDGRID_API_KEY missing");
   if (!fromEmail) {
     throw new Error("Set SENDGRID_FROM_EMAIL (verified sender) or SMTP_FROM");
+  }
+
+  const content = [{ type: "text/html", value: html }];
+  if (textPlain && String(textPlain).trim()) {
+    content.push({ type: "text/plain", value: String(textPlain) });
   }
 
   const res = await fetch("https://api.sendgrid.com/v3/mail/send", {
@@ -227,7 +265,7 @@ async function sendViaSendGrid(to, subject, html) {
         },
       ],
       from: { email: fromEmail, name: "Kidora" },
-      content: [{ type: "text/html", value: html }],
+      content,
       categories: ["kidora", "safety_alert"],
     }),
   });
@@ -292,7 +330,7 @@ async function resolveParentRecipientEmail(row) {
 }
 
 /** Gmail / SMTP: From address is SMTP_FROM (or SMTP_USER). Parents see "Kidora <kidoraapp06@gmail.com>" when using defaults. */
-async function sendViaConfiguredSmtp(to, subject, html) {
+async function sendViaConfiguredSmtp(to, subject, html, textPlain) {
   const tx = getTransporter();
   const fromRaw = process.env.SMTP_FROM?.trim() || resolveSmtpUser() || "";
   if (!tx) {
@@ -303,7 +341,7 @@ async function sendViaConfiguredSmtp(to, subject, html) {
   }
 
   const fromHeader = fromRaw.includes("<") ? fromRaw : `"Kidora" <${fromRaw}>`;
-  const info = await tx.sendMail({
+  const mail = {
     from: fromHeader,
     to,
     subject,
@@ -314,11 +352,15 @@ async function sendViaConfiguredSmtp(to, subject, html) {
       Priority: "urgent",
       "X-MSMail-Priority": "High",
     },
-  });
+  };
+  if (textPlain && String(textPlain).trim()) {
+    mail.text = String(textPlain);
+  }
+  const info = await tx.sendMail(mail);
   return { skipped: false, via: "smtp", messageId: info.messageId };
 }
 
-async function sendParentEmail(to, subject, html) {
+async function sendParentEmail(to, subject, html, textPlain) {
   const recipient = normalizeParentEmail(to);
   if (!recipient) {
     console.warn("[safety] invalid parent email, skip send");
@@ -328,7 +370,7 @@ async function sendParentEmail(to, subject, html) {
   const prefer = (process.env.EMAIL_PROVIDER || "auto").toLowerCase().trim();
 
   async function attemptSmtp() {
-    const smtp = await sendViaConfiguredSmtp(recipient, subject, html);
+    const smtp = await sendViaConfiguredSmtp(recipient, subject, html, textPlain);
     if (!smtp.skipped) {
       return { skipped: false, via: smtp.via || "smtp", messageId: smtp.messageId };
     }
@@ -339,7 +381,7 @@ async function sendParentEmail(to, subject, html) {
     if (!process.env.RESEND_API_KEY?.trim()) {
       return { skipped: true, reason: "no_resend_api_key" };
     }
-    await sendViaResend(recipient, subject, html);
+    await sendViaResend(recipient, subject, html, textPlain);
     return { skipped: false, via: "resend" };
   }
 
@@ -347,7 +389,7 @@ async function sendParentEmail(to, subject, html) {
     if (!process.env.SENDGRID_API_KEY) {
       return { skipped: true, reason: "no_sendgrid_api_key" };
     }
-    await sendViaSendGrid(recipient, subject, html);
+    await sendViaSendGrid(recipient, subject, html, textPlain);
     return { skipped: false, via: "sendgrid" };
   }
 
@@ -494,6 +536,12 @@ router.post("/report-flagged-search", async (req, res) => {
     }
 
     const childName = rows[0].name;
+    const displayName =
+      typeof req.body.child_display_name === "string" && req.body.child_display_name.trim()
+        ? String(req.body.child_display_name).trim().slice(0, 160)
+        : null;
+    const labelForParent = (displayName && displayName.trim()) || childName || "Your child";
+
     const resolvedRecipient = await resolveParentRecipientEmail(rows[0]);
     const parentEmailNorm = resolvedRecipient.email;
     if (!parentEmailNorm) {
@@ -530,7 +578,17 @@ router.post("/report-flagged-search", async (req, res) => {
     const serverReceivedUtc = new Date().toISOString();
 
     const html = buildFlaggedSearchEmailHtml({
-      childName,
+      childName: labelForParent,
+      query: query.slice(0, 500),
+      sourcePackage,
+      deviceLocalDate,
+      deviceLocalTime,
+      deviceTimezone,
+      serverReceivedUtc,
+    });
+
+    const plain = buildFlaggedSearchEmailPlain({
+      childName: labelForParent,
       query: query.slice(0, 500),
       sourcePackage,
       deviceLocalDate,
@@ -540,27 +598,26 @@ router.post("/report-flagged-search", async (req, res) => {
     });
 
     const kw = query.length > 42 ? `${query.slice(0, 42)}…` : query;
-    const subject = `[URGENT] Kidora: "${kw}" — ${childName || "Child"}`;
-
-    // Always persist first (same MySQL as process.env.DATABASE_URL on THIS host).
-    await db.query(
-      `INSERT INTO safety_search_alerts (child_id, query_text, source_package) VALUES (?, ?, ?)`,
-      [childId, query.slice(0, 2000), sourcePackage.slice(0, 255)]
-    );
-    console.log("[safety] INSERT safety_search_alerts ok", { childId });
+    const subject = `[URGENT] Kidora: "${kw}" — ${labelForParent}`;
 
     let emailSent = false;
     let emailError = null;
     try {
-      const mailResult = await sendParentEmail(parentEmailNorm, subject, html);
+      const mailResult = await sendParentEmail(parentEmailNorm, subject, html, plain);
       emailSent = !mailResult.skipped;
       if (mailResult.skipped) {
         emailError = mailResult.reason || "skipped";
       }
     } catch (mailErr) {
-      console.error("[safety] send mail error (row already saved)", mailErr?.message || mailErr);
+      console.error("[safety] send mail error", mailErr?.message || mailErr);
       emailError = String(mailErr?.message || "email_failed").slice(0, 200);
     }
+
+    await db.query(
+      `INSERT INTO safety_search_alerts (child_id, query_text, source_package) VALUES (?, ?, ?)`,
+      [childId, query.slice(0, 2000), sourcePackage.slice(0, 255)]
+    );
+    console.log("[safety] INSERT safety_search_alerts ok", { childId, email_sent: emailSent });
 
     try {
       await db.query(
@@ -579,7 +636,7 @@ router.post("/report-flagged-search", async (req, res) => {
     try {
       await sendParentNotificationPush(db, rows[0].parent_id, {
         title: "Kidora — safety alert",
-        body: `${childName || "Child"}: flagged search detected. Open Kidora for details.`,
+        body: `${labelForParent}: flagged search detected. Open Kidora for details.`,
         type: "safety_search",
         childId,
       });
