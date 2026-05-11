@@ -97,4 +97,90 @@ async function sendReminderPush(db, childId, reminder) {
   }
 }
 
-module.exports = { sendReminderPush, getMessaging };
+let _usersFcmColumnEnsured = false;
+
+/**
+ * Adds users.fcm_token when missing (idempotent).
+ * @param {import("mysql2/promise").Pool} db
+ */
+async function ensureUsersFcmTokenColumn(db) {
+  if (_usersFcmColumnEnsured) return;
+  try {
+    await db.query("ALTER TABLE users ADD COLUMN fcm_token TEXT NULL");
+  } catch (e) {
+    const dup =
+      e.code === "ER_DUP_FIELDNAME" ||
+      String(e.message || "").toLowerCase().includes("duplicate column");
+    if (!dup) {
+      console.warn("ensureUsersFcmTokenColumn:", e.message || e);
+    }
+  }
+  _usersFcmColumnEnsured = true;
+}
+
+/**
+ * Push to the parent's device (FCM) when the app is killed or backgrounded.
+ * @param {import("mysql2/promise").Pool} db
+ * @param {number} parentId - users.id
+ * @param {{ title: string, body: string, type?: string, childId?: number|string }} payload
+ */
+async function sendParentNotificationPush(db, parentId, payload) {
+  const messaging = getMessaging();
+  if (!messaging) return;
+
+  await ensureUsersFcmTokenColumn(db);
+
+  const [rows] = await db.query(
+    "SELECT fcm_token FROM users WHERE id = ? LIMIT 1",
+    [parentId]
+  );
+  if (!rows.length) return;
+  const token = rows[0].fcm_token;
+  if (!token || String(token).trim() === "") {
+    console.log(`No parent FCM token for user id=${parentId}, skipping push`);
+    return;
+  }
+
+  const title = String(payload.title || "Kidora").slice(0, 200);
+  const body = String(payload.body || "").slice(0, 2000);
+  const type = String(payload.type || "parent_alert");
+  const childId = payload.childId != null ? String(payload.childId) : "";
+
+  const data = {
+    type,
+    child_id: childId,
+    title,
+    message: body,
+  };
+
+  try {
+    await messaging.send({
+      token: String(token).trim(),
+      notification: { title, body },
+      data,
+      android: {
+        priority: "high",
+        notification: {
+          channelId: "kidora_channel",
+          sound: "default",
+        },
+      },
+      apns: {
+        headers: { "apns-priority": "10" },
+        payload: {
+          aps: { sound: "default", contentAvailable: true },
+        },
+      },
+    });
+    console.log(`FCM parent alert sent parent_id=${parentId} type=${type}`);
+  } catch (err) {
+    console.error(`FCM parent send failed (parent_id=${parentId}):`, err.message || err);
+  }
+}
+
+module.exports = {
+  sendReminderPush,
+  sendParentNotificationPush,
+  ensureUsersFcmTokenColumn,
+  getMessaging,
+};
