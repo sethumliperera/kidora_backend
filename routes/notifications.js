@@ -2,24 +2,19 @@ const express = require("express");
 const router = express.Router();
 const db = require("../db");
 const verifyToken = require("../middleware/authMiddleware");
+const { sendParentNotificationPush } = require("../fcmReminders");
 
 // 🔔 CREATE NOTIFICATION
 router.post("/create", verifyToken, async (req, res) => {
   try {
-    const parent_id = req.user.id;
-    const { child_id, message, type } = req.body;
+    const { parent_id, child_id, message, type } = req.body;
 
-    if (!child_id || !message || !type) {
+    if (!parent_id || !child_id || !message || !type) {
       return res.status(400).json({ message: "All fields are required" });
     }
 
-    // Ensure the parent can only create notifications for owned children.
-    const [ownedRows] = await db.query(
-      "SELECT id FROM children WHERE id = ? AND parent_id = ? LIMIT 1",
-      [child_id, parent_id]
-    );
-    if (!ownedRows.length) {
-      return res.status(403).json({ message: "Unauthorized" });
+    if (Number(parent_id) !== Number(req.user.id)) {
+      return res.status(403).json({ message: "parent_id must match the signed-in account" });
     }
 
     const sql = `
@@ -34,9 +29,9 @@ router.post("/create", verifyToken, async (req, res) => {
       type,
     ]);
 
-    // ✅ GET SOCKET HELPERS
+    // ✅ GET SOCKET INSTANCE
     const io = req.app.get("io");
-    const sendToChild = req.app.get("sendToChild");
+
     const payload = {
       id: result.insertId,
       parent_id,
@@ -46,14 +41,17 @@ router.post("/create", verifyToken, async (req, res) => {
       created_at: new Date(),
     };
 
-    // ✅ EMIT REAL-TIME EVENT
-    if (typeof sendToChild === "function") {
-      await sendToChild(child_id, "new_notification", payload);
-    } else {
-      io.to(`child_${child_id}`).emit("new_notification", payload);
-    }
+    io.to(`child_${child_id}`).emit("new_notification", payload);
+    io.to(`parent_${parent_id}`).emit("new_notification", payload);
 
-    console.log("📤 Notification emitted to child ref:", child_id);
+    await sendParentNotificationPush(db, parent_id, {
+      title: "Kidora",
+      body: String(message).slice(0, 2000),
+      type: String(type),
+      childId: child_id,
+    });
+
+    console.log("📤 Notification emitted to child_%s and parent_%s", child_id, parent_id);
 
     res.json({ message: "Notification created" });
   } catch (err) {
@@ -65,24 +63,15 @@ router.post("/create", verifyToken, async (req, res) => {
 // 📥 GET NOTIFICATIONS BY CHILD
 router.get("/:child_id", verifyToken, async (req, res) => {
   try {
-    const parent_id = req.user.id;
     const { child_id } = req.params;
-
-    const [ownedRows] = await db.query(
-      "SELECT id FROM children WHERE id = ? AND parent_id = ? LIMIT 1",
-      [child_id, parent_id]
-    );
-    if (!ownedRows.length) {
-      return res.status(403).json({ message: "Unauthorized" });
-    }
 
     const sql = `
       SELECT * FROM notifications
-      WHERE child_id = ? AND parent_id = ?
+      WHERE child_id = ?
       ORDER BY created_at DESC
     `;
 
-    const [results] = await db.query(sql, [child_id, parent_id]);
+    const [results] = await db.query(sql, [child_id]);
     res.json(results);
   } catch (err) {
     console.error("Error fetching notifications:", err);
@@ -93,19 +82,7 @@ router.get("/:child_id", verifyToken, async (req, res) => {
 // 🗑️ DELETE
 router.delete("/:id", verifyToken, async (req, res) => {
   try {
-    const parent_id = req.user.id;
     const { id } = req.params;
-
-    const [rows] = await db.query(
-      "SELECT parent_id FROM notifications WHERE id = ? LIMIT 1",
-      [id]
-    );
-    if (!rows.length) {
-      return res.status(404).json({ message: "Notification not found" });
-    }
-    if (Number(rows[0].parent_id) !== Number(parent_id)) {
-      return res.status(403).json({ message: "Unauthorized" });
-    }
 
     await db.query(`DELETE FROM notifications WHERE id = ?`, [id]);
     res.json({ message: "Notification deleted" });
