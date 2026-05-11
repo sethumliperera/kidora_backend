@@ -1,6 +1,7 @@
 const express = require("express");
 const router = express.Router();
 const db = require("../db");
+const { sendParentNotificationPush } = require("../fcmReminders");
 const { resolveSmtpUser, getTransporter, getSmtpPingDiagnostics } = require("../smtpEnv");
 
 /** Default substring checks (lowercase). Extend via env BAD_SEARCH_PHRASES=comma,separated */
@@ -14,7 +15,6 @@ const DEFAULT_BLOCKED_PHRASES = [
   "escort",
   "onlyfans",
   "hentai",
-  "drugs",
   "cocaine",
   "heroin",
   "meth",
@@ -471,6 +471,17 @@ router.post("/report-flagged-search", async (req, res) => {
       );
     } catch (notifErr) {
       console.warn("[safety] notification insert", notifErr.message);
+    }
+
+    try {
+      await sendParentNotificationPush(db, rows[0].parent_id, {
+        title: "Kidora — safety alert",
+        body: `${childName || "Child"}: flagged search detected. Open Kidora for details.`,
+        type: "safety_search",
+        childId,
+      });
+    } catch (pushErr) {
+      console.warn("[safety] parent FCM", pushErr?.message || pushErr);
     }
 
     return res.json({
