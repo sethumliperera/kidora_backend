@@ -2,7 +2,6 @@ const express = require("express");
 const router = express.Router();
 const db = require("../db");
 const verifyToken = require("../middleware/authMiddleware");
-const { sendParentNotificationPush } = require("../fcmReminders");
 
 // Auto-create table helper
 async function ensureTable() {
@@ -35,7 +34,7 @@ router.post("/", async (req, res) => {
     }
 
     const [childRows] = await db.query(
-      "SELECT id, parent_id, name FROM children WHERE id = ?",
+      "SELECT id, parent_id FROM children WHERE id = ?",
       [numericChildId]
     );
     if (childRows.length === 0) {
@@ -43,18 +42,6 @@ router.post("/", async (req, res) => {
     }
 
     const parentId = childRows[0].parent_id;
-    const childName = childRows[0].name || "Your child";
-
-    const normalizedApps = apps
-      .map((app) => ({
-        package_name: String(app?.package_name || "").trim(),
-        app_name: String(app?.app_name || app?.package_name || "").trim(),
-      }))
-      .filter((app) => app.package_name.length > 0);
-
-    if (normalizedApps.length === 0) {
-      return res.status(400).json({ error: "apps must contain at least one package" });
-    }
 
     // ── Step 1: Remember existing package names (for new-install detection) ──
     const [existingRows] = await db.query(
@@ -79,7 +66,7 @@ router.post("/", async (req, res) => {
       return SOCIAL_GAMING_KEYWORDS.some((kw) => p.includes(kw) || n.includes(kw));
     };
 
-    const newApps = normalizedApps.filter(
+    const newApps = apps.filter(
       (a) => !existingPackages.has(a.package_name)
     );
 
@@ -113,47 +100,24 @@ router.post("/", async (req, res) => {
           console.error("Failed to create notification:", e.message);
         }
       }
-
-      const first = newApps[0];
-      const firstLabel = first ? first.app_name || first.package_name : "";
-      const pushBody =
-        newApps.length === 1
-          ? `${childName} installed ${firstLabel}`
-          : `${childName}: ${newApps.length} new apps (e.g. ${firstLabel})`;
-      await sendParentNotificationPush(db, parentId, {
-        title: "Kidora — new app",
-        body: pushBody,
-        type: "new_app_installed",
-        childId: numericChildId,
-      });
     }
 
-    const packageNames = normalizedApps.map((app) => app.package_name);
+    // ── Step 4: Clear old apps and re-insert ──
+    await db.query("DELETE FROM installed_apps WHERE child_id = ?", [numericChildId]);
 
-    for (const app of normalizedApps) {
+    for (const app of apps) {
       try {
         await db.query(
-          `INSERT INTO installed_apps (child_id, package_name, app_name)
-           VALUES (?, ?, ?)
-           ON DUPLICATE KEY UPDATE
-             app_name = VALUES(app_name),
-             updated_at = CURRENT_TIMESTAMP`,
-          [numericChildId, app.package_name, app.app_name || app.package_name]
+          "INSERT INTO installed_apps (child_id, package_name, app_name) VALUES (?, ?, ?)",
+          [numericChildId, app.package_name, app.app_name]
         );
       } catch (e) {
-        console.error("Failed to upsert installed app:", e.message);
+        // Skip duplicates
       }
     }
 
-    if (packageNames.length > 0 && req.body.full_sync === true) {
-      await db.query(
-        "DELETE FROM installed_apps WHERE child_id = ? AND package_name NOT IN (?)",
-        [numericChildId, packageNames]
-      );
-    }
-
     res.json({
-      message: `${normalizedApps.length} apps saved successfully`,
+      message: `${apps.length} apps saved successfully`,
       new_installs: newApps.length,
     });
   } catch (err) {
