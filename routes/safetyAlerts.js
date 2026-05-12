@@ -275,29 +275,50 @@ async function sendParentEmail(to, subject, html) {
   }
 
   const prefer = (process.env.EMAIL_PROVIDER || "auto").toLowerCase().trim();
-  const smtpFirst = prefer === "smtp" || prefer === "gmail";
+  const smtpFirst = prefer === "smtp" || prefer === "gmail" || prefer === "auto";
+
+  async function tryApiProviders() {
+    if (process.env.RESEND_API_KEY?.trim()) {
+      await sendViaResend(recipient, subject, html);
+      console.log("[safety] email sent via Resend to", recipient);
+      return { skipped: false, via: "resend" };
+    }
+    if (process.env.SENDGRID_API_KEY?.trim()) {
+      await sendViaSendGrid(recipient, subject, html);
+      console.log("[safety] email sent via SendGrid to", recipient);
+      return { skipped: false, via: "sendgrid" };
+    }
+    return null;
+  }
 
   if (smtpFirst) {
-    const smtp = await sendViaConfiguredSmtp(recipient, subject, html);
-    if (!smtp.skipped) {
-      console.log("[safety] email sent via SMTP to", recipient, smtp.messageId || "");
-      return smtp;
+    try {
+      const smtp = await sendViaConfiguredSmtp(recipient, subject, html);
+      if (!smtp.skipped) {
+        console.log("[safety] email sent via SMTP to", recipient, smtp.messageId || "");
+        return smtp;
+      }
+      console.warn("[safety] SMTP send skipped:", smtp.reason);
+    } catch (err) {
+      console.error("[safety] SMTP send failed, trying API mailer fallback:", err?.message || err);
     }
-    console.warn("[safety] EMAIL_PROVIDER=gmail/smtp but SMTP send skipped:", smtp.reason);
-    return { skipped: true, reason: smtp.reason || "smtp_not_configured" };
+
+    const api = await tryApiProviders();
+    if (api) return api;
+
+    if (prefer === "smtp" || prefer === "gmail") {
+      return { skipped: true, reason: "smtp_failed_and_no_api_mailer" };
+    }
   }
 
-  if (process.env.RESEND_API_KEY) {
-    await sendViaResend(recipient, subject, html);
-    console.log("[safety] email sent via Resend to", recipient);
-    return { skipped: false, via: "resend" };
+  if (prefer === "resend" || prefer === "sendgrid") {
+    const api = await tryApiProviders();
+    if (api) return api;
+    return { skipped: true, reason: "api_mailer_not_configured" };
   }
 
-  if (process.env.SENDGRID_API_KEY) {
-    await sendViaSendGrid(recipient, subject, html);
-    console.log("[safety] email sent via SendGrid to", recipient);
-    return { skipped: false, via: "sendgrid" };
-  }
+  const api = await tryApiProviders();
+  if (api) return api;
 
   const smtp = await sendViaConfiguredSmtp(recipient, subject, html);
   if (!smtp.skipped) {
@@ -306,7 +327,7 @@ async function sendParentEmail(to, subject, html) {
   }
 
   console.warn(
-    "[safety] No mail transport: set EMAIL_PROVIDER=gmail + SMTP_* for kidoraapp06@gmail.com (or RESEND_API_KEY / SENDGRID_API_KEY). Parent:",
+    "[safety] No mail transport: set SMTP_USER + SMTP_PASS, or RESEND_API_KEY / SENDGRID_API_KEY. Parent:",
     recipient
   );
   return { skipped: true, reason: "no_mailer_config" };
@@ -328,6 +349,10 @@ router.get("/ping", async (req, res) => {
 
     if (String(req.query.verify || "").toLowerCase() === "smtp") {
       payload.smtp_verify = await verifySmtpConnection();
+      if (!payload.smtp_verify.ok && !mail.has_resend_api_key && !mail.has_sendgrid_api_key) {
+        payload.mail_hint =
+          "Gmail SMTP could not be reached from this host (common on Render). Add RESEND_API_KEY or SENDGRID_API_KEY on kidora-api, redeploy, then call /api/safety/test-flagged-email.";
+      }
     }
 
     return res.json(payload);
