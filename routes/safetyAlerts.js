@@ -204,8 +204,10 @@ function buildFlaggedSearchEmailPlain({
 }
 
 /**
- * Flagged-search parent emails: Nodemailer SMTP via smtpEnv (`SMTP_*` / gmail implicit),
- * then Resend HTTP if `RESEND_API_KEY` + `RESEND_FROM`, then `SAFETY_EMAIL_WEBHOOK_URL`.
+ * Safety parent email transports (see SAFETY_MAIL_ORDER):
+ * - Resend / SendGrid HTTP APIs first (reliable from Render, Railway, etc.)
+ * - Then Nodemailer SMTP — Gmail smtp.gmail.com often "succeeds" but never reaches inbox from cloud IPs
+ * - Finally SAFETY_EMAIL_WEBHOOK_URL
  */
 const MAIL_TRANSPORT_TIMEOUT_MS = Math.min(
   120000,
@@ -331,6 +333,135 @@ async function attemptResendEmail(recipientNorm, subject, html, textPlain) {
   return { skipped: false, via: "resend" };
 }
 
+function parseFromForApi(raw) {
+  const s = String(raw || "").trim();
+  if (!s) return { name: "Kidora", email: "" };
+  const m = s.match(/^(.+?)\s*<([^>]+@[^>]+)>\s*$/);
+  if (m) {
+    const name = m[1].replace(/^["']|["']$/g, "").trim() || "Kidora";
+    return { name, email: m[2].trim() };
+  }
+  if (s.includes("@")) return { name: "Kidora", email: s };
+  return { name: "Kidora", email: "" };
+}
+
+/**
+ * Optional SendGrid v3 API — reliable from cloud; free tier available.
+ * SENDGRID_API_KEY (Bearer) + SENDGRID_FROM (verified sender email), or falls back to SMTP_FROM / SMTP_USER.
+ */
+async function attemptSendGridEmail(recipientNorm, subject, html, textPlain) {
+  const key = String(process.env.SENDGRID_API_KEY || "").trim();
+  let fromRaw =
+    String(process.env.SENDGRID_FROM || "").trim() ||
+    String(process.env.SMTP_FROM || "").trim() ||
+    String(process.env.SMTP_USER || "").trim();
+  const { name: fromName, email: fromEmail } = parseFromForApi(fromRaw);
+  if (!key || !fromEmail.includes("@")) {
+    return { skipped: true, reason: "no_sendgrid_config" };
+  }
+
+  const content = [];
+  const tp = textPlain && String(textPlain).trim();
+  if (tp) {
+    content.push({ type: "text/plain", value: tp });
+  }
+  content.push({ type: "text/html", value: String(html || "") });
+
+  try {
+    await promiseWithMailTimeout(
+      "sendgrid_api",
+      (async () => {
+        const ac =
+          typeof AbortSignal !== "undefined" && AbortSignal.timeout
+            ? AbortSignal.timeout(MAIL_TRANSPORT_TIMEOUT_MS)
+            : undefined;
+        const res = await fetch("https://api.sendgrid.com/v3/mail/send", {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${key}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            personalizations: [{ to: [{ email: recipientNorm }] }],
+            from: { email: fromEmail, name: fromName },
+            subject,
+            content,
+          }),
+          signal: ac,
+        });
+        if (!res.ok) {
+          const body = await res.text();
+          throw new Error(`SendGrid HTTP ${res.status}: ${body.slice(0, 400)}`);
+        }
+      })()
+    );
+  } catch (e) {
+    const msg = e?.message || String(e);
+    console.warn("[safety] SendGrid failed:", msg.slice(0, 300));
+    return { skipped: true, reason: `sendgrid:${msg.slice(0, 200)}` };
+  }
+
+  console.log("[safety] SendGrid API accepted email");
+  return { skipped: false, via: "sendgrid" };
+}
+
+function isResendConfigured() {
+  return !!(
+    String(process.env.RESEND_API_KEY || "").trim() &&
+    String(process.env.RESEND_FROM || "").trim()
+  );
+}
+
+function isSendGridConfigured() {
+  const key = String(process.env.SENDGRID_API_KEY || "").trim();
+  if (!key) return false;
+  const fromRaw =
+    String(process.env.SENDGRID_FROM || "").trim() ||
+    String(process.env.SMTP_FROM || "").trim() ||
+    String(process.env.SMTP_USER || "").trim();
+  return parseFromForApi(fromRaw).email.includes("@");
+}
+
+/**
+ * Default: resend → sendgrid → smtp (HTTP APIs before Gmail SMTP from cloud).
+ * Override: SAFETY_MAIL_ORDER="smtp,resend" (comma list: resend, sendgrid, smtp)
+ */
+function buildOrderedSafetyTransportFns(recipient, subject, html, textPlain) {
+  async function attemptSmtp() {
+    const smtp = await sendViaConfiguredSmtp(recipient, subject, html, textPlain);
+    if (!smtp.skipped) {
+      return { skipped: false, via: smtp.via || "smtp", messageId: smtp.messageId };
+    }
+    return { skipped: true, reason: smtp.reason || "smtp_not_configured" };
+  }
+  async function attemptResend() {
+    return attemptResendEmail(recipient, subject, html, textPlain);
+  }
+  async function attemptSendGrid() {
+    return attemptSendGridEmail(recipient, subject, html, textPlain);
+  }
+
+  const registry = {
+    resend: attemptResend,
+    sendgrid: attemptSendGrid,
+    smtp: attemptSmtp,
+  };
+
+  const rawOrder = String(process.env.SAFETY_MAIL_ORDER || "").trim().toLowerCase();
+  let keys;
+  if (rawOrder) {
+    keys = rawOrder
+      .split(/[\s,]+/)
+      .map((k) => k.trim())
+      .filter((k) => registry[k]);
+    if (!keys.length) keys = ["resend", "sendgrid", "smtp"];
+  } else {
+    keys = ["resend", "sendgrid", "smtp"];
+  }
+
+  return keys.map((k) => registry[k]);
+}
+
 /** Readable hint for admins / Logcat debugging when email_sent is false. */
 function deliveryHintWhenEmailSkipped(parentEmailNorm, emailSent, emailErrorRaw) {
   if (emailSent) return null;
@@ -362,13 +493,16 @@ function deliveryHintWhenEmailSkipped(parentEmailNorm, emailSent, emailErrorRaw)
   if (err.includes("resend:") || err.includes("resend http")) {
     return "RESEND_API_KEY / RESEND_FROM failed — verify the API key and that the From domain is verified in Resend.";
   }
+  if (err.includes("sendgrid:") || err.includes("sendgrid http")) {
+    return "SENDGRID_API_KEY failed — verify key and Single Sender / domain auth; set SENDGRID_FROM (or SMTP_FROM) to a verified address.";
+  }
   if (err.includes("webhook:http") || err.includes("webhook:")) {
     return "SAFETY_EMAIL_WEBHOOK_URL relay failed — fix the Zapier/Make/n8n destination or SMTP so the webhook is not needed.";
   }
   if ((diag?.on_render || diag?.on_railway) && diag?.gmail_mode && diag?.smtp_ready) {
-    return "Cloud host + Gmail SMTP often drops outbound mail silently; SMTP_* login can still succeed. Match SMTP_FROM to SMTP_USER, use RESEND_API_KEY + RESEND_FROM, or use your domain's transactional SMTP.";
+    return "Cloud host + Gmail SMTP often drops outbound mail silently; SMTP_* login can still succeed. Add RESEND_API_KEY + RESEND_FROM or SENDGRID_API_KEY (both run before SMTP), or use domain transactional SMTP.";
   }
-  return "See host logs under [safety]/[smtpEnv] and email_error in this JSON. Optional: set RESEND_API_KEY + RESEND_FROM for reliable delivery.";
+  return "See host logs under [safety]/[smtpEnv] and email_error in this JSON. For Render/cloud + Gmail SMTP: add RESEND_API_KEY+RESEND_FROM or SENDGRID_API_KEY (they run before SMTP and actually reach the inbox).";
 }
 
 /** Single recipient: parent of the child only. */
@@ -461,7 +595,7 @@ async function sendViaConfiguredSmtp(to, subject, html, textPlain) {
 }
 
 /**
- * Flagged-search parent mail: SMTP (smtpEnv), then Resend API, then webhook if both fail/skip.
+ * Flagged-search parent mail: Resend → SendGrid → SMTP (see buildOrderedSafetyTransportFns), then webhook.
  */
 async function sendParentEmail(to, subject, html, textPlain) {
   const recipient = normalizeParentEmail(to);
@@ -470,17 +604,12 @@ async function sendParentEmail(to, subject, html, textPlain) {
     return { skipped: true, reason: "invalid_email" };
   }
 
-  async function attemptSmtp() {
-    const smtp = await sendViaConfiguredSmtp(recipient, subject, html, textPlain);
-    if (!smtp.skipped) {
-      return { skipped: false, via: smtp.via || "smtp", messageId: smtp.messageId };
-    }
-    return { skipped: true, reason: smtp.reason || "smtp_not_configured" };
-  }
-
-  async function attemptResend() {
-    return attemptResendEmail(recipient, subject, html, textPlain);
-  }
+  const transportFns = buildOrderedSafetyTransportFns(
+    recipient,
+    subject,
+    html,
+    textPlain
+  );
 
   async function tryChain(fns) {
     const errors = [];
@@ -526,7 +655,7 @@ async function sendParentEmail(to, subject, html, textPlain) {
     };
   }
 
-  return runMailChain([attemptSmtp, attemptResend]);
+  return runMailChain(transportFns);
 }
 
 // GET /api/safety/ping — verify DB + mail config (no auth; for deploy checks only)
@@ -546,22 +675,35 @@ router.get("/ping", async (_req, res) => {
     } catch (e) {
       safety_stats = { error: String(e?.message || e).slice(0, 200) };
     }
+    const resendOk = isResendConfigured();
+    const sendgridOk = isSendGridConfigured();
+    const safety_http_configured = resendOk || sendgridOk;
+    const cloudGmailOnly =
+      (mail.on_render || mail.on_railway) &&
+      mail.gmail_mode &&
+      mail.smtp_ready &&
+      !safety_http_configured;
+
     return res.json({
       ok: true,
       db: true,
       ...safety_stats,
       ...mail,
       safety_email_webhook_set: !!String(process.env.SAFETY_EMAIL_WEBHOOK_URL || "").trim(),
-      resend_configured: !!(
-        String(process.env.RESEND_API_KEY || "").trim() &&
-        String(process.env.RESEND_FROM || "").trim()
-      ),
+      resend_configured: resendOk,
+      sendgrid_configured: sendgridOk,
+      safety_http_configured: safety_http_configured,
+      safety_mail_order_effective:
+        String(process.env.SAFETY_MAIL_ORDER || "").trim() || "resend,sendgrid,smtp",
       email_provider: String(process.env.EMAIL_PROVIDER || "auto").trim() || "auto",
-      safety_mail_transport: "smtp_resend_webhook",
-      safety_mail_order: "smtp_then_resend_then_webhook_if_needed",
+      safety_mail_transport: "resend_sendgrid_smtp_webhook",
+      safety_mail_order: "resend_then_sendgrid_then_smtp_then_webhook_if_needed",
       mail_timeout_ms_default: MAIL_TRANSPORT_TIMEOUT_MS,
       auto_mail_order_hint:
-        "Safety alert email: SMTP (SMTP_* via smtpEnv), then Resend (RESEND_API_KEY + RESEND_FROM), then SAFETY_EMAIL_WEBHOOK_URL if earlier steps fail or skip.",
+        "Safety emails try Resend, then SendGrid (HTTP), then SMTP, then webhook. On Render with Gmail SMTP, inbox delivery often fails unless you add RESEND_* or SENDGRID_API_KEY.",
+      safety_inbox_action_required: cloudGmailOnly
+        ? "Add RESEND_API_KEY+RESEND_FROM and/or SENDGRID_API_KEY (+ verified SENDGRID_FROM or use SMTP_FROM). Gmail SMTP from cloud usually does not reach the parent inbox even when smtp_ready is true."
+        : null,
     });
   } catch (err) {
     console.error("[safety] ping", err);
@@ -793,10 +935,8 @@ router.post("/report-flagged-search", async (req, res) => {
         email_error: emailError,
         parent_email_source: resolvedRecipient.source,
         smtp_ready: !!mailDiag.smtp_ready,
-        resend_configured: !!(
-          String(process.env.RESEND_API_KEY || "").trim() &&
-          String(process.env.RESEND_FROM || "").trim()
-        ),
+        resend_configured: isResendConfigured(),
+        sendgrid_configured: isSendGridConfigured(),
         webhook_set: !!String(process.env.SAFETY_EMAIL_WEBHOOK_URL || "").trim(),
       });
     }
@@ -819,13 +959,12 @@ router.post("/report-flagged-search", async (req, res) => {
         : null,
       mail_env: {
         smtp_ready: !!mailDiag.smtp_ready,
-        safety_mail_transport: "smtp_resend_webhook",
-        safety_mail_order: "smtp_then_resend_then_webhook_if_needed",
+        safety_mail_transport: "resend_sendgrid_smtp_webhook",
+        safety_mail_order: "resend_then_sendgrid_then_smtp_then_webhook_if_needed",
+        safety_mail_order_override: String(process.env.SAFETY_MAIL_ORDER || "").trim() || null,
         safety_email_webhook_set: !!String(process.env.SAFETY_EMAIL_WEBHOOK_URL || "").trim(),
-        resend_configured: !!(
-          String(process.env.RESEND_API_KEY || "").trim() &&
-          String(process.env.RESEND_FROM || "").trim()
-        ),
+        resend_configured: isResendConfigured(),
+        sendgrid_configured: isSendGridConfigured(),
         email_provider: String(process.env.EMAIL_PROVIDER || "auto").trim() || "auto",
         delivery_hint:
           deliveryHintWhenEmailSkipped(parentEmailNorm, emailSent, emailError) || undefined,
