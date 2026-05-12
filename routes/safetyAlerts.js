@@ -1,7 +1,7 @@
 const express = require("express");
 const router = express.Router();
 const db = require("../db");
-const { resolveSmtpUser, getTransporter, getSmtpPingDiagnostics } = require("../smtpEnv");
+const { resolveSmtpUser, getSmtpPingDiagnostics, verifySmtpConnection, sendMailWithConfiguredTransport } = require("../smtpEnv");
 
 /** Default substring checks (lowercase). Extend via env BAD_SEARCH_PHRASES=comma,separated */
 const DEFAULT_BLOCKED_PHRASES = [
@@ -246,21 +246,18 @@ function normalizeParentEmail(raw) {
 
 /** Gmail / SMTP: From address is SMTP_FROM (or SMTP_USER). Parents see "Kidora <kidoraapp06@gmail.com>" when using defaults. */
 async function sendViaConfiguredSmtp(to, subject, html) {
-  const tx = getTransporter();
   const fromRaw = process.env.SMTP_FROM?.trim() || resolveSmtpUser() || "";
-  if (!tx) {
-    return { skipped: true, reason: "no_smtp_transport" };
-  }
   if (!fromRaw) {
     return { skipped: true, reason: "no_smtp_from_set_SMTP_FROM_or_SMTP_USER" };
   }
 
   const fromHeader = fromRaw.includes("<") ? fromRaw : `"Kidora" <${fromRaw}>`;
-  const info = await tx.sendMail({
+  return sendMailWithConfiguredTransport({
     from: fromHeader,
     to,
     subject,
     html,
+    text: `Kidora flagged search alert. Open the HTML version of this email for full details.`,
     headers: {
       "X-Priority": "1",
       Importance: "high",
@@ -268,7 +265,6 @@ async function sendViaConfiguredSmtp(to, subject, html) {
       "X-MSMail-Priority": "High",
     },
   });
-  return { skipped: false, via: "smtp", messageId: info.messageId };
 }
 
 async function sendParentEmail(to, subject, html) {
@@ -317,18 +313,134 @@ async function sendParentEmail(to, subject, html) {
 }
 
 // GET /api/safety/ping — verify DB + mail config (no auth; for deploy checks only)
-router.get("/ping", async (_req, res) => {
+router.get("/ping", async (req, res) => {
   try {
     await db.query("SELECT 1 AS ok");
     const mail = getSmtpPingDiagnostics();
-    return res.json({
+    const payload = {
       ok: true,
       db: true,
       ...mail,
-    });
+    };
+
+    const [childCountRows] = await db.query("SELECT COUNT(*) AS n FROM children");
+    payload.children_in_db = Number(childCountRows[0]?.n ?? 0);
+
+    if (String(req.query.verify || "").toLowerCase() === "smtp") {
+      payload.smtp_verify = await verifySmtpConnection();
+    }
+
+    return res.json(payload);
   } catch (err) {
     console.error("[safety] ping", err);
     return res.status(500).json({ ok: false, db: false, error: String(err?.message || err) });
+  }
+});
+
+// POST /api/safety/test-flagged-email — send the real parent alert template for a linked child
+router.post("/test-flagged-email", async (req, res) => {
+  try {
+    const childId = parseInt(String(req.body.child_id || ""), 10);
+    if (!childId || Number.isNaN(childId)) {
+      return res.status(400).json({ ok: false, error: "child_id required" });
+    }
+
+    const [rows] = await db.query(
+      `SELECT c.id, c.name, c.parent_id, u.email AS parent_email
+       FROM children c
+       JOIN users u ON u.id = c.parent_id
+       WHERE c.id = ?`,
+      [childId]
+    );
+
+    if (!rows.length) {
+      return res.status(404).json({
+        ok: false,
+        error: "child not found",
+        hint:
+          "This API uses DATABASE_URL on the host (e.g. Render). Point it at the same MySQL as Railway if you expect rows there.",
+      });
+    }
+
+    const { name: childName, parent_email: parentEmail } = rows[0];
+    const parentEmailNorm = normalizeParentEmail(parentEmail);
+    if (!parentEmailNorm) {
+      return res.status(400).json({ ok: false, error: "parent email missing or invalid" });
+    }
+
+    const query =
+      typeof req.body.query === "string" && req.body.query.trim()
+        ? req.body.query.trim().slice(0, 500)
+        : "how to use vape";
+    const sourcePackage =
+      typeof req.body.source_package === "string"
+        ? req.body.source_package.slice(0, 255)
+        : "com.google.android.googlequicksearchbox";
+    const deviceLocalDate =
+      typeof req.body.device_local_date === "string"
+        ? req.body.device_local_date.slice(0, 120)
+        : new Date().toLocaleDateString("en-US", {
+            weekday: "long",
+            year: "numeric",
+            month: "long",
+            day: "numeric",
+          });
+    const deviceLocalTime =
+      typeof req.body.device_local_time === "string"
+        ? req.body.device_local_time.slice(0, 40)
+        : new Date().toLocaleTimeString("en-GB", { hour12: false });
+    const deviceTimezone =
+      typeof req.body.device_timezone === "string"
+        ? req.body.device_timezone.slice(0, 120)
+        : "Asia/Colombo";
+    const serverReceivedUtc = new Date().toISOString();
+
+    const html = buildFlaggedSearchEmailHtml({
+      childName,
+      query,
+      sourcePackage,
+      deviceLocalDate,
+      deviceLocalTime,
+      deviceTimezone,
+      serverReceivedUtc,
+    });
+
+    const kw = query.length > 42 ? `${query.slice(0, 42)}…` : query;
+    const subject = `[URGENT] Kidora: "${kw}" — ${childName || "Child"}`;
+
+    let emailSent = false;
+    let emailError = null;
+    let messageId = null;
+    try {
+      const mailResult = await sendParentEmail(parentEmailNorm, subject, html);
+      emailSent = !mailResult.skipped;
+      messageId = mailResult.messageId || null;
+      if (mailResult.skipped) {
+        emailError = mailResult.reason || "skipped";
+      }
+    } catch (mailErr) {
+      console.error("[safety] test-flagged-email send error", mailErr?.message || mailErr);
+      emailError = String(mailErr?.message || "email_failed").slice(0, 300);
+    }
+
+    return res.json({
+      ok: emailSent,
+      email_sent: emailSent,
+      email_error: emailError,
+      message_id: messageId,
+      parent_email_masked: (() => {
+        const [loc, dom] = parentEmailNorm.split("@");
+        if (!dom) return "***";
+        return `${(loc || "?").slice(0, 1)}***@${dom}`;
+      })(),
+    });
+  } catch (err) {
+    console.error("[safety] test-flagged-email", err);
+    return res.status(500).json({
+      ok: false,
+      error: "server_error",
+      detail: String(err?.message || err).slice(0, 300),
+    });
   }
 });
 
@@ -447,9 +559,11 @@ router.post("/report-flagged-search", async (req, res) => {
 
     let emailSent = false;
     let emailError = null;
+    let messageId = null;
     try {
       const mailResult = await sendParentEmail(parentEmailNorm, subject, html);
       emailSent = !mailResult.skipped;
+      messageId = mailResult.messageId || null;
       if (mailResult.skipped) {
         emailError = mailResult.reason || "skipped";
       }
@@ -477,6 +591,7 @@ router.post("/report-flagged-search", async (req, res) => {
       logged: true,
       email_sent: emailSent,
       email_error: emailError,
+      message_id: messageId,
       parent_email_masked: (() => {
         const [loc, dom] = parentEmailNorm.split("@");
         if (!dom) return "***";
