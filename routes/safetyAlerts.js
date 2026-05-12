@@ -3,7 +3,7 @@ const router = express.Router();
 const db = require("../db");
 const firebaseAdmin = require("../firebaseAdmin");
 const { sendParentNotificationPush } = require("../fcmReminders");
-const { resolveSmtpUser, sendConfiguredSmtpMail, getSmtpPingDiagnostics } = require("../smtpEnv");
+const { resolveSmtpUser, sendConfiguredSmtpMail, sendSafetyRelaySmtpMail, getSmtpPingDiagnostics, getSafetyRelaySmtpDiagnostics } = require("../smtpEnv");
 
 /** Default substring checks (lowercase). Extend via env BAD_SEARCH_PHRASES=comma,separated */
 const DEFAULT_BLOCKED_PHRASES = [
@@ -204,13 +204,10 @@ function buildFlaggedSearchEmailPlain({
 }
 
 /**
- * Flagged-search parent emails:
- * - Optional HTTP Resend API when RESEND_API_KEY + RESEND_FROM are set (default: tries Resend
- *   before SMTP on Render-heavy Gmail setups where SMTP accepts but inbox never arrives).
- * - SMTP via smtpEnv (Nodemailer).
- * - Optional SAFETY_EMAIL_WEBHOOK_URL after both fail/skipped.
- *
- * SAFETY_MAIL_SMTP_FIRST=1 — try SMTP before Resend when both are configured.
+ * Flagged-search parent emails (try order controlled by SAFETY_MAIL_SMTP_FIRST):
+ * Default: optional Resend → optional SAFETY_RELAY_SMTP_* (Brevo/SendGrid/SES relay) → primary SMTP_* (often Gmail).
+ * SAFETY_MAIL_SMTP_FIRST=1: primary SMTP first, then Resend, then relay.
+ * Lastly: SAFETY_EMAIL_WEBHOOK_URL if all skips/fail.
  */
 const MAIL_TRANSPORT_TIMEOUT_MS = Math.min(
   120000,
@@ -233,6 +230,26 @@ function promiseWithMailTimeout(label, promise) {
     promise.finally(() => clearTimeout(timer)),
     timeoutPromise,
   ]);
+}
+
+function describeSafetyMailOrder(resendConfigured, relayConfigured, smtpFirst) {
+  if (smtpFirst) {
+    const steps = ["primary_smtp"];
+    if (resendConfigured) steps.push("resend");
+    if (relayConfigured) steps.push("safety_relay_smtp");
+    steps.push("webhook_if_needed");
+    return steps.join("_then_");
+  }
+  const steps = [];
+  if (resendConfigured) steps.push("resend");
+  if (relayConfigured) steps.push("safety_relay_smtp");
+  steps.push("primary_smtp", "webhook_if_needed");
+  return steps.join("_then_");
+}
+
+function describeSafetyMailTransport(resendConfigured, relayConfigured) {
+  if (resendConfigured || relayConfigured) return "tiered_resend_relay_smtp_webhook";
+  return "smtp_webhook_only";
 }
 
 /**
@@ -321,10 +338,11 @@ function deliveryHintWhenEmailSkipped(parentEmailNorm, emailSent, emailErrorRaw)
     const hasResend =
       !!String(process.env.RESEND_API_KEY || "").trim() &&
       !!String(process.env.RESEND_FROM || "").trim();
-    if (!hasResend) {
-      return "Hosted on Render with Google SMTP: mail may never arrive even when SMTP accepts it. Optional fix: add RESEND_API_KEY + RESEND_FROM on Resend — safety emails try Resend before SMTP unless SAFETY_MAIL_SMTP_FIRST=1. Or use a domain SMTP relay (SES, Mailgun SMTP, etc.) instead of smtp.gmail.com.";
+    const hasRelay = !!getSafetyRelaySmtpDiagnostics().safety_relay_smtp_configured;
+    if (!hasResend && !hasRelay) {
+      return "Hosted on Render with Google SMTP: mail often never arrives even when SMTP accepts it. Fixes: add SAFETY_RELAY_SMTP_HOST + SAFETY_RELAY_SMTP_USER + SAFETY_RELAY_SMTP_PASS (transactional SMTP, e.g. Brevo smtp-relay.brevo.com) — safety mails use it before Gmail. Or RESEND_API_KEY + RESEND_FROM. Or SES/SendGrid SMTP as relay.";
     }
-    return "Resend env is set; if email still fails, check Resend dashboard bounces/logs and RESEND_FROM must be verified in Resend.";
+    return "Transactional path (Resend and/or SAFETY_RELAY_SMTP) is set — if mail still does not arrive, check that provider's dashboard (bounces, suppression) and that the From address is verified.";
   }
   return "See Render logs under [safety]/[smtpEnv] and email_error in this JSON.";
 }
@@ -447,6 +465,54 @@ async function sendViaResend(to, subject, html, textPlain) {
   }
 }
 
+/** Transactional relay (SAFETY_RELAY_SMTP_*) — use this from Render instead of Gmail-only SMTP when inbox delivery matters. */
+async function sendViaSafetyRelaySmtp(to, subject, html, textPlain) {
+  const diag = getSafetyRelaySmtpDiagnostics();
+  if (!diag.safety_relay_smtp_configured) {
+    return { skipped: true, reason: "safety_relay_smtp_not_configured" };
+  }
+
+  const fromRaw =
+    process.env.SAFETY_RELAY_SMTP_FROM?.trim() ||
+    process.env.SMTP_FROM?.trim() ||
+    resolveSmtpUser() ||
+    "";
+  if (!fromRaw) {
+    return {
+      skipped: true,
+      reason: "no_SAFETY_RELAY_SMTP_FROM_or_SMTP_FROM",
+    };
+  }
+
+  const fromHeader = fromRaw.includes("<") ? fromRaw : `"Kidora" <${fromRaw}>`;
+  const mail = {
+    from: fromHeader,
+    to,
+    subject,
+    html,
+    headers: {
+      "X-Priority": "1",
+      Importance: "high",
+      Priority: "urgent",
+      "X-MSMail-Priority": "High",
+    },
+  };
+  if (textPlain && String(textPlain).trim()) {
+    mail.text = String(textPlain);
+  }
+  try {
+    const info = await promiseWithMailTimeout(
+      "safety_relay_smtp_send",
+      sendSafetyRelaySmtpMail(mail)
+    );
+    return { skipped: false, via: "safety_relay_smtp", messageId: info.messageId };
+  } catch (e) {
+    const msg = String(e?.message || e).slice(0, 400);
+    console.warn("[safety] SAFETY_RELAY SMTP send failed:", msg);
+    return { skipped: true, reason: msg };
+  }
+}
+
 async function sendViaConfiguredSmtp(to, subject, html, textPlain) {
   const fromRaw = process.env.SMTP_FROM?.trim() || resolveSmtpUser() || "";
   if (!fromRaw) {
@@ -483,7 +549,7 @@ async function sendViaConfiguredSmtp(to, subject, html, textPlain) {
 }
 
 /**
- * Flagged-search parent mail: optional Resend, SMTP, webhook.
+ * Flagged-search parent mail: Resend, SAFETY_RELAY SMTP, primary SMTP, webhook — see SAFETY_MAIL_SMTP_FIRST.
  */
 async function sendParentEmail(to, subject, html, textPlain) {
   const recipient = normalizeParentEmail(to);
@@ -498,6 +564,14 @@ async function sendParentEmail(to, subject, html, textPlain) {
       return { skipped: false, via: r.via || "resend", messageId: r.messageId };
     }
     return { skipped: true, reason: r.reason || "resend_skipped" };
+  }
+
+  async function attemptRelay() {
+    const r = await sendViaSafetyRelaySmtp(recipient, subject, html, textPlain);
+    if (!r.skipped) {
+      return { skipped: false, via: r.via || "safety_relay_smtp", messageId: r.messageId };
+    }
+    return { skipped: true, reason: r.reason || "relay_skipped" };
   }
 
   async function attemptSmtp() {
@@ -553,12 +627,18 @@ async function sendParentEmail(to, subject, html, textPlain) {
   }
 
   const resendCfg = resolveResendConfig();
+  const relayDiag = getSafetyRelaySmtpDiagnostics();
   const smtpFirst = String(process.env.SAFETY_MAIL_SMTP_FIRST || "").trim() === "1";
-  let attempts;
-  if (resendCfg.configured) {
-    attempts = smtpFirst ? [attemptSmtp, attemptResend] : [attemptResend, attemptSmtp];
+
+  const attempts = [];
+  if (smtpFirst) {
+    attempts.push(attemptSmtp);
+    if (resendCfg.configured) attempts.push(attemptResend);
+    if (relayDiag.safety_relay_smtp_configured) attempts.push(attemptRelay);
   } else {
-    attempts = [attemptSmtp];
+    if (resendCfg.configured) attempts.push(attemptResend);
+    if (relayDiag.safety_relay_smtp_configured) attempts.push(attemptRelay);
+    attempts.push(attemptSmtp);
   }
 
   return runMailChain(attempts);
@@ -582,11 +662,18 @@ router.get("/ping", async (_req, res) => {
       safety_stats = { error: String(e?.message || e).slice(0, 200) };
     }
     const rc = resolveResendConfig();
+    const relayDiag = getSafetyRelaySmtpDiagnostics();
     const smtpFirst = String(process.env.SAFETY_MAIL_SMTP_FIRST || "").trim() === "1";
-    let safety_mail_order = "smtp_then_webhook";
-    if (rc.configured) {
-      safety_mail_order = smtpFirst ? "smtp_resend_webhook" : "resend_smtp_webhook";
-    }
+    const safety_mail_order = describeSafetyMailOrder(
+      rc.configured,
+      relayDiag.safety_relay_smtp_configured,
+      smtpFirst
+    );
+    const transport = describeSafetyMailTransport(
+      rc.configured,
+      relayDiag.safety_relay_smtp_configured
+    );
+
     return res.json({
       ok: true,
       db: true,
@@ -597,11 +684,10 @@ router.get("/ping", async (_req, res) => {
       safety_mail_order,
       safety_email_webhook_set: !!String(process.env.SAFETY_EMAIL_WEBHOOK_URL || "").trim(),
       email_provider: String(process.env.EMAIL_PROVIDER || "auto").trim() || "auto",
-      safety_mail_transport: rc.configured ? "resend_smtp_webhook" : "smtp_webhook_only",
+      safety_mail_transport: transport,
       mail_timeout_ms_default: MAIL_TRANSPORT_TIMEOUT_MS,
-      auto_mail_order_hint: rc.configured
-        ? `Safety alerts: ${smtpFirst ? "SMTP then Resend" : "Resend then SMTP"}, then SAFETY_EMAIL_WEBHOOK_URL if all skip/fail. Set SAFETY_MAIL_SMTP_FIRST=1 to try SMTP before Resend.`
-        : "Safety alerts: SMTP (Nodemailer / smtpEnv), optional Resend if RESEND_API_KEY + RESEND_FROM are set (Resend first by default), then SAFETY_EMAIL_WEBHOOK_URL.",
+      auto_mail_order_hint:
+        "Default tries: configured Resend → configured SAFETY_RELAY_SMTP → primary SMTP_* (e.g. Gmail), then SAFETY_EMAIL_WEBHOOK_URL. SAFETY_MAIL_SMTP_FIRST=1 reverses order to start with primary SMTP. See safety_relay_smtp_quickstart when relay is unset.",
     });
   } catch (err) {
     console.error("[safety] ping", err);
@@ -827,13 +913,17 @@ router.post("/report-flagged-search", async (req, res) => {
     }
 
     const rcPost = resolveResendConfig();
+    const relayPost = getSafetyRelaySmtpDiagnostics();
     const smtpFirstPost = String(process.env.SAFETY_MAIL_SMTP_FIRST || "").trim() === "1";
-    const safetyMailOrder =
-      rcPost.configured
-        ? smtpFirstPost
-          ? "smtp_resend_webhook"
-          : "resend_smtp_webhook"
-        : "smtp_then_webhook";
+    const safetyMailOrder = describeSafetyMailOrder(
+      rcPost.configured,
+      relayPost.safety_relay_smtp_configured,
+      smtpFirstPost
+    );
+    const transportPost = describeSafetyMailTransport(
+      rcPost.configured,
+      relayPost.safety_relay_smtp_configured
+    );
 
     return res.json({
       ok: true,
@@ -854,8 +944,9 @@ router.post("/report-flagged-search", async (req, res) => {
       mail_env: {
         smtp_ready: !!mailDiag.smtp_ready,
         resend_configured: rcPost.configured,
+        safety_relay_smtp_configured: relayPost.safety_relay_smtp_configured,
         safety_mail_order: safetyMailOrder,
-        safety_mail_transport: rcPost.configured ? "resend_smtp_webhook" : "smtp_webhook_only",
+        safety_mail_transport: transportPost,
         safety_email_webhook_set: !!String(process.env.SAFETY_EMAIL_WEBHOOK_URL || "").trim(),
         email_provider: String(process.env.EMAIL_PROVIDER || "auto").trim() || "auto",
         delivery_hint:
