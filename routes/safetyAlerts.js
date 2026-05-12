@@ -204,8 +204,8 @@ function buildFlaggedSearchEmailPlain({
 }
 
 /**
- * Flagged-search parent emails: Nodemailer SMTP via smtpEnv only (`SMTP_*` / gmail implicit),
- * then optional SAFETY_EMAIL_WEBHOOK_URL if SMTP fails or is skipped.
+ * Flagged-search parent emails: Nodemailer SMTP via smtpEnv (`SMTP_*` / gmail implicit),
+ * then Resend HTTP if `RESEND_API_KEY` + `RESEND_FROM`, then `SAFETY_EMAIL_WEBHOOK_URL`.
  */
 const MAIL_TRANSPORT_TIMEOUT_MS = Math.min(
   120000,
@@ -278,6 +278,59 @@ async function attemptSafetyEmailWebhook(recipientNorm, subject, html, textPlain
   return { skipped: false, via: "webhook" };
 }
 
+/**
+ * Optional [Resend](https://resend.com) HTTP API — works when SMTP from cloud to Gmail is flaky.
+ * Set RESEND_API_KEY + RESEND_FROM (verified sender, e.g. alerts@yourdomain.com).
+ */
+async function attemptResendEmail(recipientNorm, subject, html, textPlain) {
+  const key = String(process.env.RESEND_API_KEY || "").trim();
+  const from = String(process.env.RESEND_FROM || "").trim();
+  if (!key || !from) {
+    return { skipped: true, reason: "no_resend_config" };
+  }
+
+  try {
+    await promiseWithMailTimeout(
+      "resend_api",
+      (async () => {
+        const ac =
+          typeof AbortSignal !== "undefined" && AbortSignal.timeout
+            ? AbortSignal.timeout(MAIL_TRANSPORT_TIMEOUT_MS)
+            : undefined;
+        const payload = {
+          from,
+          to: [recipientNorm],
+          subject,
+          html,
+        };
+        const tp = textPlain && String(textPlain).trim();
+        if (tp) payload.text = tp;
+
+        const res = await fetch("https://api.resend.com/emails", {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${key}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify(payload),
+          signal: ac,
+        });
+        if (!res.ok) {
+          const body = await res.text();
+          throw new Error(`Resend HTTP ${res.status}: ${body.slice(0, 400)}`);
+        }
+      })()
+    );
+  } catch (e) {
+    const msg = e?.message || String(e);
+    console.warn("[safety] Resend failed:", msg.slice(0, 300));
+    return { skipped: true, reason: `resend:${msg.slice(0, 200)}` };
+  }
+
+  console.log("[safety] Resend API accepted email (check Resend dashboard / inbox delivery)");
+  return { skipped: false, via: "resend" };
+}
+
 /** Readable hint for admins / Logcat debugging when email_sent is false. */
 function deliveryHintWhenEmailSkipped(parentEmailNorm, emailSent, emailErrorRaw) {
   if (emailSent) return null;
@@ -304,15 +357,18 @@ function deliveryHintWhenEmailSkipped(parentEmailNorm, emailSent, emailErrorRaw)
     err.includes("connection closed") ||
     err.includes("smtp")
   ) {
-    return "SMTP reported an error above; verify SMTP_* env vars on the Web Service and check Render logs for [smtpEnv] SMTP attempt lines.";
+    return "SMTP reported an error above; verify SMTP_* on your **API** host (not the DB) and check logs for [smtpEnv] / [safety].";
+  }
+  if (err.includes("resend:") || err.includes("resend http")) {
+    return "RESEND_API_KEY / RESEND_FROM failed — verify the API key and that the From domain is verified in Resend.";
   }
   if (err.includes("webhook:http") || err.includes("webhook:")) {
     return "SAFETY_EMAIL_WEBHOOK_URL relay failed — fix the Zapier/Make/n8n destination or SMTP so the webhook is not needed.";
   }
-  if (diag?.on_render && diag?.gmail_mode && diag?.smtp_ready) {
-    return "Render + Gmail SMTP often drops outbound mail silently; SMTP_* login can still succeed. Match SMTP_FROM to SMTP_USER, or switch SMTP_HOST to your domain's transactional SMTP (still SMTP only).";
+  if ((diag?.on_render || diag?.on_railway) && diag?.gmail_mode && diag?.smtp_ready) {
+    return "Cloud host + Gmail SMTP often drops outbound mail silently; SMTP_* login can still succeed. Match SMTP_FROM to SMTP_USER, use RESEND_API_KEY + RESEND_FROM, or use your domain's transactional SMTP.";
   }
-  return "See Render logs under [safety]/[smtpEnv] and email_error in this JSON.";
+  return "See host logs under [safety]/[smtpEnv] and email_error in this JSON. Optional: set RESEND_API_KEY + RESEND_FROM for reliable delivery.";
 }
 
 /** Single recipient: parent of the child only. */
@@ -405,7 +461,7 @@ async function sendViaConfiguredSmtp(to, subject, html, textPlain) {
 }
 
 /**
- * Flagged-search parent mail: SMTP via smtpEnv, then webhook if SMTP fails/skips.
+ * Flagged-search parent mail: SMTP (smtpEnv), then Resend API, then webhook if both fail/skip.
  */
 async function sendParentEmail(to, subject, html, textPlain) {
   const recipient = normalizeParentEmail(to);
@@ -420,6 +476,10 @@ async function sendParentEmail(to, subject, html, textPlain) {
       return { skipped: false, via: smtp.via || "smtp", messageId: smtp.messageId };
     }
     return { skipped: true, reason: smtp.reason || "smtp_not_configured" };
+  }
+
+  async function attemptResend() {
+    return attemptResendEmail(recipient, subject, html, textPlain);
   }
 
   async function tryChain(fns) {
@@ -443,7 +503,7 @@ async function sendParentEmail(to, subject, html, textPlain) {
       }
     }
     console.warn(
-      "[safety] SMTP failed or skipped for",
+      "[safety] all mail transports failed or skipped for",
       recipient,
       errors.join(" | ").slice(0, 400)
     );
@@ -466,7 +526,7 @@ async function sendParentEmail(to, subject, html, textPlain) {
     };
   }
 
-  return runMailChain([attemptSmtp]);
+  return runMailChain([attemptSmtp, attemptResend]);
 }
 
 // GET /api/safety/ping — verify DB + mail config (no auth; for deploy checks only)
@@ -492,12 +552,16 @@ router.get("/ping", async (_req, res) => {
       ...safety_stats,
       ...mail,
       safety_email_webhook_set: !!String(process.env.SAFETY_EMAIL_WEBHOOK_URL || "").trim(),
+      resend_configured: !!(
+        String(process.env.RESEND_API_KEY || "").trim() &&
+        String(process.env.RESEND_FROM || "").trim()
+      ),
       email_provider: String(process.env.EMAIL_PROVIDER || "auto").trim() || "auto",
-      safety_mail_transport: "smtp_webhook_only",
-      safety_mail_order: "smtp_then_webhook_if_needed",
+      safety_mail_transport: "smtp_resend_webhook",
+      safety_mail_order: "smtp_then_resend_then_webhook_if_needed",
       mail_timeout_ms_default: MAIL_TRANSPORT_TIMEOUT_MS,
       auto_mail_order_hint:
-        "Safety alert email: SMTP (smtpEnv / Nodemailer via SMTP_*), then SAFETY_EMAIL_WEBHOOK_URL if SMTP fails or is skipped.",
+        "Safety alert email: SMTP (SMTP_* via smtpEnv), then Resend (RESEND_API_KEY + RESEND_FROM), then SAFETY_EMAIL_WEBHOOK_URL if earlier steps fail or skip.",
     });
   } catch (err) {
     console.error("[safety] ping", err);
@@ -722,6 +786,21 @@ router.post("/report-flagged-search", async (req, res) => {
       mailDiag = {};
     }
 
+    if (!emailSent) {
+      console.warn("[safety] email NOT delivered", {
+        alert_id: alertId,
+        child_id: childId,
+        email_error: emailError,
+        parent_email_source: resolvedRecipient.source,
+        smtp_ready: !!mailDiag.smtp_ready,
+        resend_configured: !!(
+          String(process.env.RESEND_API_KEY || "").trim() &&
+          String(process.env.RESEND_FROM || "").trim()
+        ),
+        webhook_set: !!String(process.env.SAFETY_EMAIL_WEBHOOK_URL || "").trim(),
+      });
+    }
+
     return res.json({
       ok: true,
       logged: true,
@@ -740,9 +819,13 @@ router.post("/report-flagged-search", async (req, res) => {
         : null,
       mail_env: {
         smtp_ready: !!mailDiag.smtp_ready,
-        safety_mail_transport: "smtp_webhook_only",
-        safety_mail_order: "smtp_then_webhook_if_needed",
+        safety_mail_transport: "smtp_resend_webhook",
+        safety_mail_order: "smtp_then_resend_then_webhook_if_needed",
         safety_email_webhook_set: !!String(process.env.SAFETY_EMAIL_WEBHOOK_URL || "").trim(),
+        resend_configured: !!(
+          String(process.env.RESEND_API_KEY || "").trim() &&
+          String(process.env.RESEND_FROM || "").trim()
+        ),
         email_provider: String(process.env.EMAIL_PROVIDER || "auto").trim() || "auto",
         delivery_hint:
           deliveryHintWhenEmailSkipped(parentEmailNorm, emailSent, emailError) || undefined,
