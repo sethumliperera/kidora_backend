@@ -145,7 +145,7 @@ router.post("/", async (req, res) => {
       }
     }
 
-    if (packageNames.length > 0) {
+    if (packageNames.length > 0 && req.body.full_sync === true) {
       await db.query(
         "DELETE FROM installed_apps WHERE child_id = ? AND package_name NOT IN (?)",
         [numericChildId, packageNames]
