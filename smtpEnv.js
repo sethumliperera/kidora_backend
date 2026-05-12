@@ -102,6 +102,31 @@ function isLikelyGmailAccount(userRaw) {
   return u.endsWith("@gmail.com") || u.endsWith("@googlemail.com");
 }
 
+/** Extract bare email from "Name <a@b.com>" or "a@b.com". */
+function extractEmailAddr(raw) {
+  const s = String(raw || "").trim();
+  if (!s) return "";
+  const m = s.match(/<([^<>]+@[^<>]+)>/);
+  const inner = (m ? m[1] : s).trim();
+  return inner.toLowerCase();
+}
+
+/** When From domain does not match the authenticated mailbox Gmail often drops or rejects. */
+function computeSmtpFromIdentityWarning(opts) {
+  const { gmailMode, smtpReady } = opts;
+  const user = resolveSmtpUser().trim().toLowerCase();
+  const fromRaw = String(process.env.SMTP_FROM || "").trim();
+  if (!smtpReady || !user || !gmailMode || !fromRaw) return null;
+  const fromAddr = extractEmailAddr(fromRaw);
+  if (!fromAddr.includes("@")) return null;
+  if (fromAddr !== user.toLowerCase()) {
+    return (
+      `SMTP_FROM (${fromAddr}) should match SMTP_USER (${user}) when using Gmail/Google SMTP — mismatched identities often fail or never reach the inbox.`
+    );
+  }
+  return null;
+}
+
 /**
  * Back-compat export: true when nodemailer's built-in Gmail service would be chosen
  * (no explicit SMTP_HOST on the host env).
@@ -127,16 +152,14 @@ function getTransporter() {
     const host = String(resolveSmtpHostRaw()).trim().toLowerCase();
     const port = parseInt(readEnvKey("SMTP_PORT").value || "587", 10);
     const secureRaw = readEnvKey("SMTP_SECURE").value;
-    const secure =
-      secureRaw === "1" ||
-      String(secureRaw).toLowerCase() === "true" ||
-      String(secureRaw).toLowerCase() === "yes";
+    const secure = parseSmtpSecureRaw(secureRaw);
     transporter = nodemailer.createTransport({
       host,
       port,
       secure,
       auth,
       requireTLS: !secure && port === 587,
+      tls: { minVersion: "TLSv1.2" },
       connectionTimeout: 20000,
       greetingTimeout: 20000,
       socketTimeout: 45000,
@@ -151,6 +174,7 @@ function getTransporter() {
     transporter = nodemailer.createTransport({
       service: "gmail",
       auth,
+      tls: { minVersion: "TLSv1.2" },
       connectionTimeout: 20000,
       greetingTimeout: 20000,
       socketTimeout: 45000,
@@ -163,6 +187,105 @@ function getTransporter() {
     "[smtpEnv] SMTP_HOST missing - set SMTP_HOST (+ SMTP_PORT, SMTP_SECURE) on the Web Service, or use @gmail.com SMTP_USER + EMAIL_PROVIDER=gmail for implicit Gmail."
   );
   return null;
+}
+
+function parseSmtpSecureRaw(secureRaw) {
+  return (
+    secureRaw === "1" ||
+    String(secureRaw).toLowerCase() === "true" ||
+    String(secureRaw).toLowerCase() === "yes"
+  );
+}
+
+/** After transient failure from cloud → Gmail SMTP, retry the alternate port/TLS combo. */
+function shouldTryAlternateGmailSmtpProfile(err) {
+  const m = `${err?.code || ""} ${err?.responseCode || ""} ${String(
+    err?.message || err?.response || err?.command || ""
+  )}`.toLowerCase();
+  if (
+    /invalid user|invalid login|authentication(?:d)? failure|credentials|password|bad.*password|eauth|534|535|denied/i.test(m)
+  ) {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Sends with env SMTP. For explicit smtp.gmail.com, retries 465 SMTPS if env used 587 (and vice‑versa),
+ * unless `GMAIL_SMTP_ALT_RETRY=0`.
+ */
+async function sendConfiguredSmtpMail(mailOptions) {
+  const user = resolveSmtpUser();
+  const pass = resolveSmtpPass();
+  if (!user || !pass) {
+    throw new Error("SMTP_USER and SMTP_PASS are required to send mail.");
+  }
+  const auth = { user, pass };
+
+  if (!hasConfiguredSmtpHost()) {
+    const tx = getTransporter();
+    if (!tx) throw new Error("SMTP transport not configured (SMTP_HOST / Gmail implicit).");
+    return tx.sendMail(mailOptions);
+  }
+
+  const host = String(resolveSmtpHostRaw()).trim().toLowerCase();
+  const envPort = parseInt(readEnvKey("SMTP_PORT").value || "587", 10);
+  const envSecure = parseSmtpSecureRaw(readEnvKey("SMTP_SECURE").value);
+
+  const profiles = [];
+  const keySeen = new Set();
+  const add = (port, secure, tag) => {
+    const k = `${port}|${secure}`;
+    if (keySeen.has(k)) return;
+    keySeen.add(k);
+    profiles.push({ host, port, secure, tag });
+  };
+
+  add(envPort, envSecure, "smtp_env");
+
+  const altOk =
+    process.env.GMAIL_SMTP_ALT_RETRY !== "0" &&
+    smtpHostLooksLikeGoogle(resolveSmtpHostRaw());
+
+  if (altOk) {
+    if (envPort === 587 && !envSecure) {
+      add(465, true, "gmail_alt_465_smtps");
+    } else if (envPort === 465 && envSecure === true) {
+      add(587, false, "gmail_alt_587_starttls");
+    }
+  }
+
+  let lastErr = null;
+  for (let i = 0; i < profiles.length; i++) {
+    const p = profiles[i];
+    const tx = nodemailer.createTransport({
+      host: p.host,
+      port: p.port,
+      secure: p.secure,
+      auth,
+      requireTLS: !p.secure && p.port === 587,
+      tls: { minVersion: "TLSv1.2" },
+      connectionTimeout: 22000,
+      greetingTimeout: 22000,
+      socketTimeout: 50000,
+    });
+    try {
+      const info = await tx.sendMail(mailOptions);
+      if (profiles.length > 1 && p.tag !== "smtp_env") {
+        console.log(
+          `[smtpEnv] Gmail SMTP succeeded on fallback (${p.tag} → ${p.host}:${p.port} secure=${p.secure}).`
+        );
+      }
+      return info;
+    } catch (e) {
+      lastErr = e;
+      const brief = String(e?.message || e).slice(0, 260);
+      console.warn(`[smtpEnv] SMTP attempt ${p.tag} ${p.host}:${p.port} failed: ${brief}`);
+      if (profiles[i + 1] && shouldTryAlternateGmailSmtpProfile(e)) continue;
+      break;
+    }
+  }
+  throw lastErr || new Error("SMTP send failed");
 }
 
 function getSmtpPingDiagnostics() {
@@ -207,17 +330,26 @@ function getSmtpPingDiagnostics() {
   const hasApis = hasResend || hasBrevo || hasSendgrid;
   /** When smtp looks fine but parent mail still fails — common on Render + Gmail. */
   let safety_email_note = null;
+
+  const gmailExplicitHostFallback =
+    gmailMode &&
+    hasConfiguredSmtpHost() &&
+    smtpHostLooksLikeGoogle(resolveSmtpHostRaw()) &&
+    process.env.GMAIL_SMTP_ALT_RETRY !== "0";
+
+  const smtpFromIdentityWarning = computeSmtpFromIdentityWarning({ gmailMode, smtpReady });
+
   if (!hasApis && onRender && smtpReady && gmailMode) {
     safety_email_note =
-      "Render + Gmail SMTP alone is unreliable: Google often blocks or delays logins from datacenter IPs even with an App Password. " +
-      "Fix: add RESEND_API_KEY + RESEND_FROM, or BREVO_API_KEY (or SENDINBLUE_API_KEY) + BREVO_SENDER_EMAIL (verified in Brevo), or SENDGRID_API_KEY; redeploy. " +
-      "EMAIL_PROVIDER=gmail still uses those APIs before Gmail when keys are present. SAFETY_EMAIL_WEBHOOK_URL is a last-step relay after transports fail.";
+      "Render + Gmail SMTP is often blocked or filtered by Google even when login succeeds: parents may never see mail. Reliable fix: add RESEND_API_KEY + verified RESEND_FROM (resend.com free tier) or SENDGRID_API_KEY. This server retries Gmail on 465 if 587 fails (GMAIL_SMTP_ALT_RETRY=0 disables). Set SMTP_FROM to the same address as SMTP_USER for Gmail.";
   }
 
   return {
     smtp_ready: smtpReady,
     smtp_transport,
     gmail_mode: gmailMode,
+    gmail_smtp_dual_port_fallback: gmailExplicitHostFallback,
+    smtp_identity_warning: smtpFromIdentityWarning,
     has_smtp_user: hasUser,
     has_smtp_pass: hasPass,
     smtp_user_env_key: userPick.matchedKey,
@@ -254,6 +386,7 @@ module.exports = {
   hasConfiguredSmtpHost,
   shouldUseGmailServiceTransport,
   getTransporter,
+  sendConfiguredSmtpMail,
   getSmtpPingDiagnostics,
   logSmtpStartup,
 };
