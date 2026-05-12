@@ -45,6 +45,17 @@ router.post("/", async (req, res) => {
     const parentId = childRows[0].parent_id;
     const childName = childRows[0].name || "Your child";
 
+    const normalizedApps = apps
+      .map((app) => ({
+        package_name: String(app?.package_name || "").trim(),
+        app_name: String(app?.app_name || app?.package_name || "").trim(),
+      }))
+      .filter((app) => app.package_name.length > 0);
+
+    if (normalizedApps.length === 0) {
+      return res.status(400).json({ error: "apps must contain at least one package" });
+    }
+
     // ── Step 1: Remember existing package names (for new-install detection) ──
     const [existingRows] = await db.query(
       "SELECT package_name FROM installed_apps WHERE child_id = ?",
@@ -68,7 +79,7 @@ router.post("/", async (req, res) => {
       return SOCIAL_GAMING_KEYWORDS.some((kw) => p.includes(kw) || n.includes(kw));
     };
 
-    const newApps = apps.filter(
+    const newApps = normalizedApps.filter(
       (a) => !existingPackages.has(a.package_name)
     );
 
@@ -117,22 +128,32 @@ router.post("/", async (req, res) => {
       });
     }
 
-    // ── Step 4: Clear old apps and re-insert ──
-    await db.query("DELETE FROM installed_apps WHERE child_id = ?", [numericChildId]);
+    const packageNames = normalizedApps.map((app) => app.package_name);
 
-    for (const app of apps) {
+    for (const app of normalizedApps) {
       try {
         await db.query(
-          "INSERT INTO installed_apps (child_id, package_name, app_name) VALUES (?, ?, ?)",
-          [numericChildId, app.package_name, app.app_name]
+          `INSERT INTO installed_apps (child_id, package_name, app_name)
+           VALUES (?, ?, ?)
+           ON DUPLICATE KEY UPDATE
+             app_name = VALUES(app_name),
+             updated_at = CURRENT_TIMESTAMP`,
+          [numericChildId, app.package_name, app.app_name || app.package_name]
         );
       } catch (e) {
-        // Skip duplicates
+        console.error("Failed to upsert installed app:", e.message);
       }
     }
 
+    if (packageNames.length > 0) {
+      await db.query(
+        "DELETE FROM installed_apps WHERE child_id = ? AND package_name NOT IN (?)",
+        [numericChildId, packageNames]
+      );
+    }
+
     res.json({
-      message: `${apps.length} apps saved successfully`,
+      message: `${normalizedApps.length} apps saved successfully`,
       new_installs: newApps.length,
     });
   } catch (err) {
