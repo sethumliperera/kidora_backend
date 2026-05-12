@@ -1,8 +1,7 @@
 const express = require("express");
 const router = express.Router();
 const db = require("../db");
-const { getSmtpPingDiagnostics, verifySmtpConnection } = require("../smtpEnv");
-const { getMailPingDiagnostics, sendParentEmail } = require("../mailDelivery");
+const { resolveSmtpUser, getTransporter, getSmtpPingDiagnostics } = require("../smtpEnv");
 
 /** Default substring checks (lowercase). Extend via env BAD_SEARCH_PHRASES=comma,separated */
 const DEFAULT_BLOCKED_PHRASES = [
@@ -158,6 +157,85 @@ function buildFlaggedSearchEmailHtml({
 </body></html>`;
 }
 
+/**
+ * Resend — optional alternative to Gmail SMTP (https://resend.com).
+ * Only used if RESEND_API_KEY is set and EMAIL_PROVIDER != gmail/smtp.
+ */
+async function sendViaResend(to, subject, html) {
+  const key = process.env.RESEND_API_KEY?.trim();
+  const from =
+    process.env.RESEND_FROM?.trim() ||
+    "Kidora <onboarding@resend.dev>";
+  if (!key) throw new Error("RESEND_API_KEY missing");
+
+  const res = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${key}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      from,
+      to: [to],
+      subject,
+      html,
+      headers: {
+        "X-Priority": "1",
+        Importance: "high",
+      },
+    }),
+  });
+
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Resend HTTP ${res.status}: ${body.slice(0, 500)}`);
+  }
+}
+
+/**
+ * SendGrid Web API. Free tier ~100 emails/day for new accounts.
+ */
+async function sendViaSendGrid(to, subject, html) {
+  const key = process.env.SENDGRID_API_KEY;
+  const fromEmail =
+    process.env.SENDGRID_FROM_EMAIL?.trim() ||
+    process.env.SMTP_FROM?.trim() ||
+    resolveSmtpUser();
+  if (!key) throw new Error("SENDGRID_API_KEY missing");
+  if (!fromEmail) {
+    throw new Error("Set SENDGRID_FROM_EMAIL (verified sender) or SMTP_FROM");
+  }
+
+  const res = await fetch("https://api.sendgrid.com/v3/mail/send", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${key}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      personalizations: [
+        {
+          to: [{ email: to }],
+          subject,
+          headers: {
+            "X-Priority": "1",
+            Importance: "high",
+            Priority: "urgent",
+          },
+        },
+      ],
+      from: { email: fromEmail, name: "Kidora" },
+      content: [{ type: "text/html", value: html }],
+      categories: ["kidora", "safety_alert"],
+    }),
+  });
+
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`SendGrid HTTP ${res.status}: ${body.slice(0, 500)}`);
+  }
+}
+
 /** Single recipient: parent of the child only. */
 function normalizeParentEmail(raw) {
   const s = String(raw || "").trim();
@@ -166,174 +244,91 @@ function normalizeParentEmail(raw) {
   return s;
 }
 
-function buildSmtpFailureHint(errorText, mail) {
-  const err = String(errorText || "").toLowerCase();
-  const onRender = !!mail.on_render;
-  const renderFree =
-    onRender &&
-    String(process.env.RENDER_INSTANCE_TYPE || "free").toLowerCase().includes("free");
+/** Gmail / SMTP: From address is SMTP_FROM (or SMTP_USER). Parents see "Kidora <kidoraapp06@gmail.com>" when using defaults. */
+async function sendViaConfiguredSmtp(to, subject, html) {
+  const tx = getTransporter();
+  const fromRaw = process.env.SMTP_FROM?.trim() || resolveSmtpUser() || "";
+  if (!tx) {
+    return { skipped: true, reason: "no_smtp_transport" };
+  }
+  if (!fromRaw) {
+    return { skipped: true, reason: "no_smtp_from_set_SMTP_FROM_or_SMTP_USER" };
+  }
 
-  if (err.includes("timeout") || err.includes("etimedout") || err.includes("econnrefused")) {
-    if (renderFree) {
-      return (
-        "Render free web services block outbound Gmail SMTP (ports 587/465). Set EMAIL_PROVIDER=resend and RESEND_API_KEY on kidora-api, redeploy, then call /api/safety/test-flagged-email. Or upgrade to a paid Render instance for Gmail SMTP."
-      );
+  const fromHeader = fromRaw.includes("<") ? fromRaw : `"Kidora" <${fromRaw}>`;
+  const info = await tx.sendMail({
+    from: fromHeader,
+    to,
+    subject,
+    html,
+    headers: {
+      "X-Priority": "1",
+      Importance: "high",
+      Priority: "urgent",
+      "X-MSMail-Priority": "High",
+    },
+  });
+  return { skipped: false, via: "smtp", messageId: info.messageId };
+}
+
+async function sendParentEmail(to, subject, html) {
+  const recipient = normalizeParentEmail(to);
+  if (!recipient) {
+    console.warn("[safety] invalid parent email, skip send");
+    return { skipped: true, reason: "invalid_email" };
+  }
+
+  const prefer = (process.env.EMAIL_PROVIDER || "auto").toLowerCase().trim();
+  const smtpFirst = prefer === "smtp" || prefer === "gmail";
+
+  if (smtpFirst) {
+    const smtp = await sendViaConfiguredSmtp(recipient, subject, html);
+    if (!smtp.skipped) {
+      console.log("[safety] email sent via SMTP to", recipient, smtp.messageId || "");
+      return smtp;
     }
-    return (
-      "This server cannot reach Gmail SMTP. Set SMTP_HOST=smtp.gmail.com, SMTP_PORT=587, SMTP_SECURE=false, EMAIL_PROVIDER=gmail, and use a Gmail App Password (not your normal password) in SMTP_PASS."
-    );
+    console.warn("[safety] EMAIL_PROVIDER=gmail/smtp but SMTP send skipped:", smtp.reason);
+    return { skipped: true, reason: smtp.reason || "smtp_not_configured" };
   }
 
-  if (err.includes("invalid login") || err.includes("username and password") || err.includes("authentication")) {
-    return "Gmail rejected SMTP_USER/SMTP_PASS. Use a 16-character Google App Password with 2-Step Verification enabled; remove spaces from SMTP_PASS.";
+  if (process.env.RESEND_API_KEY) {
+    await sendViaResend(recipient, subject, html);
+    console.log("[safety] email sent via Resend to", recipient);
+    return { skipped: false, via: "resend" };
   }
 
-  return "Gmail SMTP is configured but login/send failed. Check SMTP_USER, SMTP_PASS (App Password), and redeploy kidora-api.";
+  if (process.env.SENDGRID_API_KEY) {
+    await sendViaSendGrid(recipient, subject, html);
+    console.log("[safety] email sent via SendGrid to", recipient);
+    return { skipped: false, via: "sendgrid" };
+  }
+
+  const smtp = await sendViaConfiguredSmtp(recipient, subject, html);
+  if (!smtp.skipped) {
+    console.log("[safety] email sent via SMTP to", recipient, smtp.messageId || "");
+    return smtp;
+  }
+
+  console.warn(
+    "[safety] No mail transport: set EMAIL_PROVIDER=gmail + SMTP_* for kidoraapp06@gmail.com (or RESEND_API_KEY / SENDGRID_API_KEY). Parent:",
+    recipient
+  );
+  return { skipped: true, reason: "no_mailer_config" };
 }
 
 // GET /api/safety/ping — verify DB + mail config (no auth; for deploy checks only)
-router.get("/ping", async (req, res) => {
+router.get("/ping", async (_req, res) => {
   try {
     await db.query("SELECT 1 AS ok");
-    const mail = getMailPingDiagnostics();
-    const smtp = getSmtpPingDiagnostics();
-    const payload = {
+    const mail = getSmtpPingDiagnostics();
+    return res.json({
       ok: true,
       db: true,
       ...mail,
-      smtp_ready: smtp.smtp_ready,
-      gmail_mode: smtp.gmail_mode,
-      has_smtp_user: smtp.has_smtp_user,
-      has_smtp_pass: smtp.has_smtp_pass,
-      smtp_user_env_key: smtp.smtp_user_env_key,
-      smtp_pass_env_key: smtp.smtp_pass_env_key,
-      smtp_host_set: smtp.smtp_host_set,
-    };
-
-    const [childCountRows] = await db.query("SELECT COUNT(*) AS n FROM children");
-    payload.children_in_db = Number(childCountRows[0]?.n ?? 0);
-
-    const verifySmtp =
-      payload.mail_transport === "smtp" &&
-      String(req.query.verify || "skip").toLowerCase() === "smtp";
-    if (verifySmtp) {
-      payload.smtp_verify = await verifySmtpConnection();
-      if (!payload.smtp_verify.ok) {
-        payload.hint = buildSmtpFailureHint(payload.smtp_verify.error, smtp);
-      }
-    }
-
-    return res.json(payload);
+    });
   } catch (err) {
     console.error("[safety] ping", err);
     return res.status(500).json({ ok: false, db: false, error: String(err?.message || err) });
-  }
-});
-
-// POST /api/safety/test-flagged-email — send the real parent alert template for a linked child
-router.post("/test-flagged-email", async (req, res) => {
-  try {
-    const childId = parseInt(String(req.body.child_id || ""), 10);
-    if (!childId || Number.isNaN(childId)) {
-      return res.status(400).json({ ok: false, error: "child_id required" });
-    }
-
-    const [rows] = await db.query(
-      `SELECT c.id, c.name, c.parent_id, u.email AS parent_email
-       FROM children c
-       JOIN users u ON u.id = c.parent_id
-       WHERE c.id = ?`,
-      [childId]
-    );
-
-    if (!rows.length) {
-      return res.status(404).json({
-        ok: false,
-        error: "child not found",
-        hint:
-          "This API uses DATABASE_URL on the host (e.g. Render). Point it at the same MySQL as Railway if you expect rows there.",
-      });
-    }
-
-    const { name: childName, parent_email: parentEmail } = rows[0];
-    const parentEmailNorm = normalizeParentEmail(parentEmail);
-    if (!parentEmailNorm) {
-      return res.status(400).json({ ok: false, error: "parent email missing or invalid" });
-    }
-
-    const query =
-      typeof req.body.query === "string" && req.body.query.trim()
-        ? req.body.query.trim().slice(0, 500)
-        : "how to use vape";
-    const sourcePackage =
-      typeof req.body.source_package === "string"
-        ? req.body.source_package.slice(0, 255)
-        : "com.google.android.googlequicksearchbox";
-    const deviceLocalDate =
-      typeof req.body.device_local_date === "string"
-        ? req.body.device_local_date.slice(0, 120)
-        : new Date().toLocaleDateString("en-US", {
-            weekday: "long",
-            year: "numeric",
-            month: "long",
-            day: "numeric",
-          });
-    const deviceLocalTime =
-      typeof req.body.device_local_time === "string"
-        ? req.body.device_local_time.slice(0, 40)
-        : new Date().toLocaleTimeString("en-GB", { hour12: false });
-    const deviceTimezone =
-      typeof req.body.device_timezone === "string"
-        ? req.body.device_timezone.slice(0, 120)
-        : "Asia/Colombo";
-    const serverReceivedUtc = new Date().toISOString();
-
-    const html = buildFlaggedSearchEmailHtml({
-      childName,
-      query,
-      sourcePackage,
-      deviceLocalDate,
-      deviceLocalTime,
-      deviceTimezone,
-      serverReceivedUtc,
-    });
-
-    const kw = query.length > 42 ? `${query.slice(0, 42)}…` : query;
-    const subject = `[URGENT] Kidora: "${kw}" — ${childName || "Child"}`;
-
-    let emailSent = false;
-    let emailError = null;
-    let messageId = null;
-    try {
-      const mailResult = await sendParentEmail(parentEmailNorm, subject, html);
-      emailSent = !mailResult.skipped;
-      messageId = mailResult.messageId || null;
-      if (mailResult.skipped) {
-        emailError = mailResult.reason || "skipped";
-      }
-    } catch (mailErr) {
-      console.error("[safety] test-flagged-email send error", mailErr?.message || mailErr);
-      emailError = String(mailErr?.message || "email_failed").slice(0, 300);
-    }
-
-    return res.json({
-      ok: emailSent,
-      email_sent: emailSent,
-      email_error: emailError,
-      message_id: messageId,
-      parent_email_masked: (() => {
-        const [loc, dom] = parentEmailNorm.split("@");
-        if (!dom) return "***";
-        return `${(loc || "?").slice(0, 1)}***@${dom}`;
-      })(),
-    });
-  } catch (err) {
-    console.error("[safety] test-flagged-email", err);
-    return res.status(500).json({
-      ok: false,
-      error: "server_error",
-      detail: String(err?.message || err).slice(0, 300),
-    });
   }
 });
 
@@ -452,11 +447,9 @@ router.post("/report-flagged-search", async (req, res) => {
 
     let emailSent = false;
     let emailError = null;
-    let messageId = null;
     try {
       const mailResult = await sendParentEmail(parentEmailNorm, subject, html);
       emailSent = !mailResult.skipped;
-      messageId = mailResult.messageId || null;
       if (mailResult.skipped) {
         emailError = mailResult.reason || "skipped";
       }
@@ -484,7 +477,6 @@ router.post("/report-flagged-search", async (req, res) => {
       logged: true,
       email_sent: emailSent,
       email_error: emailError,
-      message_id: messageId,
       parent_email_masked: (() => {
         const [loc, dom] = parentEmailNorm.split("@");
         if (!dom) return "***";
