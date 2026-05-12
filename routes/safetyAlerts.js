@@ -329,6 +329,39 @@ async function sendViaSendGrid(to, subject, html, textPlain) {
   }
 }
 
+/** Readable hint for admins / Logcat debugging when email_sent is false. */
+function deliveryHintWhenEmailSkipped(parentEmailNorm, emailSent, emailErrorRaw) {
+  if (emailSent) return null;
+  if (!parentEmailNorm) {
+    return "Open Kidora parent app while signed in to sync Firebase email into MySQL, or ensure firebase_uid matches the Firebase project.";
+  }
+  const err = String(emailErrorRaw || "").toLowerCase();
+  const from = String(process.env.RESEND_FROM || "").toLowerCase();
+  if (from.includes("onboarding@resend.dev") || from.includes("@resend.dev")) {
+    return "RESEND_FROM is a sandbox/domain-limited sender. Set RESEND_FROM to Kidora <noreply@your-verified-domain.com> in Resend (verify domain DNS) and redeploy.";
+  }
+  if (err.includes("resend http 403") || err.includes("domain not verified")) {
+    return "Resend rejected send: verify sender domain/DNS at resend.com and set RESEND_FROM.";
+  }
+  if (
+    err.includes("username and password") ||
+    err.includes("invalid login") ||
+    err.includes("gmail") ||
+    err.includes("blocked") ||
+    err.includes("timed out") ||
+    err.includes("econn refused")
+  ) {
+    return "Gmail SMTP from a cloud server often fails. Use EMAIL_PROVIDER=auto with RESEND_API_KEY plus verified RESEND_FROM (or SENDGRID_*). Set SAFETY_MAIL_APIS_FIRST=1 if SMTP must not run first.";
+  }
+  if (
+    String(process.env.RESEND_API_KEY || "").trim() === "" &&
+    String(process.env.SENDGRID_API_KEY || "").trim() === ""
+  ) {
+    return "No RESEND_API_KEY or SENDGRID_API_KEY on API host — only SMTP applies; fix Gmail app password/host or add Resend.";
+  }
+  return "See Render/host logs line [safety] all mail transports failed… and email_error in this JSON.";
+}
+
 /** Single recipient: parent of the child only. */
 function normalizeParentEmail(raw) {
   const s = String(raw || "").trim();
@@ -794,6 +827,8 @@ router.post("/report-flagged-search", async (req, res) => {
         resend_api_key_set: !!String(process.env.RESEND_API_KEY || "").trim(),
         sendgrid_api_key_set: !!String(process.env.SENDGRID_API_KEY || "").trim(),
         email_provider: String(process.env.EMAIL_PROVIDER || "auto").trim() || "auto",
+        delivery_hint:
+          deliveryHintWhenEmailSkipped(parentEmailNorm, emailSent, emailError) || undefined,
       },
       push_sent: !!pushResult.sent,
       push_skipped: pushResult.skipped || null,
