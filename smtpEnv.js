@@ -294,12 +294,17 @@ function getSmtpPingDiagnostics() {
   else if (gmailReady) smtp_transport = "gmail_service";
   const emailProvider = readEnvKey("EMAIL_PROVIDER").value || "auto";
   const onRender = !!(process.env.RENDER || process.env.RENDER_SERVICE_ID);
+  const onRailway = !!(
+    process.env.RAILWAY_ENVIRONMENT ||
+    process.env.RAILWAY_SERVICE_ID ||
+    process.env.RAILWAY_PROJECT_ID
+  );
 
   let hint = null;
   if (!smtpReady) {
     hint =
-      "This Node process has no SMTP_USER/SMTP_PASS (or aliases). Add them on the SAME Render Web Service that serves this URL (not only inside an Environment Group). " +
-      "Dashboard: Services -> select kidora-api (or your API service) -> Environment -> add variables OR link your Environment Group here -> Save -> Manual Deploy. " +
+      "This Node process has no SMTP_USER/SMTP_PASS (or aliases). Add them on the **API / Node** service that runs server.js (not the MySQL service). " +
+      "Render: Web Service -> Environment. Railway: Backend service -> Variables (not the database plugin). " +
       "Checked keys: " +
       SMTP_USER_ENV_KEYS.join(", ") +
       " / " +
@@ -308,6 +313,10 @@ function getSmtpPingDiagnostics() {
     if (onRender) {
       hint +=
         " If you edited an Environment Group only: open the Web Service -> Environment -> link that group to this service.";
+    }
+    if (onRailway) {
+      hint +=
+        " On Railway, MySQL variables do not apply to the Node process — open your deploy service and add SMTP_* there, then redeploy.";
     }
   }
 
@@ -322,9 +331,9 @@ function getSmtpPingDiagnostics() {
 
   const smtpFromIdentityWarning = computeSmtpFromIdentityWarning({ gmailMode, smtpReady });
 
-  if (onRender && smtpReady && gmailMode) {
+  if ((onRender || onRailway) && smtpReady && gmailMode) {
     safety_email_note =
-      "Render + Google SMTP (smtp.gmail.com): mail may never reach the inbox even when SMTP login succeeds. Use the same mailbox in SMTP_FROM and SMTP_USER; port 465 is retried if 587 fails (set GMAIL_SMTP_ALT_RETRY=0 to disable). Still SMTP-only: point SMTP_HOST / SMTP_USER / SMTP_PASS at your domain's transactional SMTP instead of smtp.gmail.com if you need reliable delivery from a host like Render.";
+      "Cloud host + Google SMTP (smtp.gmail.com): mail may never reach the inbox even when SMTP login succeeds. Match SMTP_FROM to SMTP_USER; port 465 is retried if 587 fails (set GMAIL_SMTP_ALT_RETRY=0 to disable). Prefer domain transactional SMTP, or configure RESEND_API_KEY + RESEND_FROM for safety emails (see /api/safety/ping).";
   }
 
   return {
@@ -342,6 +351,7 @@ function getSmtpPingDiagnostics() {
     hint,
     safety_email_note,
     on_render: onRender,
+    on_railway: onRailway,
     render_service_name: process.env.RENDER_SERVICE_NAME || null,
     render_external_url: process.env.RENDER_EXTERNAL_URL || null,
     render_service_id: process.env.RENDER_SERVICE_ID || null,
