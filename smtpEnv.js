@@ -145,6 +145,17 @@ function getSmtpPingDiagnostics() {
     }
   }
 
+  const hasResend = !!String(process.env.RESEND_API_KEY || "").trim();
+  const hasSendgrid = !!String(process.env.SENDGRID_API_KEY || "").trim();
+  /** When smtp looks fine but parent mail still fails — common on Render + Gmail. */
+  let safety_email_note = null;
+  if (!hasResend && !hasSendgrid && onRender && smtpReady && gmailMode) {
+    safety_email_note =
+      "Render + Gmail SMTP alone is unreliable: Google often blocks or delays logins from datacenter IPs even with an App Password. " +
+      "Fix: add RESEND_API_KEY + RESEND_FROM (verified domain at resend.com), set EMAIL_PROVIDER=auto, redeploy. " +
+      "(With EMAIL_PROVIDER=gmail, Resend/SendGrid still run after SMTP if you add those keys.)";
+  }
+
   return {
     smtp_ready: smtpReady,
     gmail_mode: gmailMode,
@@ -155,6 +166,7 @@ function getSmtpPingDiagnostics() {
     smtp_host_set: hostSet,
     email_provider: emailProvider || "auto",
     hint,
+    safety_email_note,
     on_render: onRender,
     render_service_name: process.env.RENDER_SERVICE_NAME || null,
     render_external_url: process.env.RENDER_EXTERNAL_URL || null,
