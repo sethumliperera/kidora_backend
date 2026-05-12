@@ -207,12 +207,41 @@ function buildFlaggedSearchEmailPlain({
  * Resend — optional alternative to Gmail SMTP (https://resend.com).
  * Only used if RESEND_API_KEY is set and EMAIL_PROVIDER != gmail/smtp.
  */
+const MAIL_TRANSPORT_TIMEOUT_MS = Math.min(
+  120000,
+  Math.max(
+    10000,
+    parseInt(process.env.SAFETY_MAIL_TRANSPORT_TIMEOUT_MS || "35000", 10) || 35000
+  )
+);
+
+/** Avoid one slow/hung SMTP connection blocking fallback mailers. */
+function promiseWithMailTimeout(label, promise) {
+  let timer;
+  const timeoutPromise = new Promise((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`${label}: timed out after ${MAIL_TRANSPORT_TIMEOUT_MS}ms`)),
+      MAIL_TRANSPORT_TIMEOUT_MS
+    );
+  });
+  return Promise.race([
+    promise.finally(() => clearTimeout(timer)),
+    timeoutPromise,
+  ]);
+}
+
 async function sendViaResend(to, subject, html, textPlain) {
   const key = process.env.RESEND_API_KEY?.trim();
   const from =
     process.env.RESEND_FROM?.trim() ||
     "Kidora <onboarding@resend.dev>";
   if (!key) throw new Error("RESEND_API_KEY missing");
+  const fromLc = String(from).toLowerCase();
+  if (fromLc.includes("onboarding@resend.dev") || fromLc.includes("@resend.dev")) {
+    console.warn(
+      "[safety] Resend RESEND_FROM is a dev/sandbox sender — inbox delivery requires a verified domain in Resend dashboard. Set RESEND_FROM=kidora@yourdomain.com."
+    );
+  }
 
   const payload = {
     from,
@@ -228,6 +257,9 @@ async function sendViaResend(to, subject, html, textPlain) {
     payload.text = String(textPlain);
   }
 
+  const ac = typeof AbortSignal !== "undefined" && AbortSignal.timeout
+    ? AbortSignal.timeout(MAIL_TRANSPORT_TIMEOUT_MS)
+    : undefined;
   const res = await fetch("https://api.resend.com/emails", {
     method: "POST",
     headers: {
@@ -235,6 +267,7 @@ async function sendViaResend(to, subject, html, textPlain) {
       "Content-Type": "application/json",
     },
     body: JSON.stringify(payload),
+    signal: ac,
   });
 
   if (!res.ok) {
@@ -262,12 +295,16 @@ async function sendViaSendGrid(to, subject, html, textPlain) {
     content.push({ type: "text/plain", value: String(textPlain) });
   }
 
+  const sgAc = typeof AbortSignal !== "undefined" && AbortSignal.timeout
+    ? AbortSignal.timeout(MAIL_TRANSPORT_TIMEOUT_MS)
+    : undefined;
   const res = await fetch("https://api.sendgrid.com/v3/mail/send", {
     method: "POST",
     headers: {
       Authorization: `Bearer ${key}`,
       "Content-Type": "application/json",
     },
+    signal: sgAc,
     body: JSON.stringify({
       personalizations: [
         {
@@ -372,7 +409,7 @@ async function sendViaConfiguredSmtp(to, subject, html, textPlain) {
   if (textPlain && String(textPlain).trim()) {
     mail.text = String(textPlain);
   }
-  const info = await tx.sendMail(mail);
+  const info = await promiseWithMailTimeout("smtp_send", tx.sendMail(mail));
   return { skipped: false, via: "smtp", messageId: info.messageId };
 }
 
@@ -397,7 +434,10 @@ async function sendParentEmail(to, subject, html, textPlain) {
     if (!process.env.RESEND_API_KEY?.trim()) {
       return { skipped: true, reason: "no_resend_api_key" };
     }
-    await sendViaResend(recipient, subject, html, textPlain);
+    await promiseWithMailTimeout(
+      "resend_send",
+      sendViaResend(recipient, subject, html, textPlain)
+    );
     return { skipped: false, via: "resend" };
   }
 
@@ -405,7 +445,10 @@ async function sendParentEmail(to, subject, html, textPlain) {
     if (!process.env.SENDGRID_API_KEY) {
       return { skipped: true, reason: "no_sendgrid_api_key" };
     }
-    await sendViaSendGrid(recipient, subject, html, textPlain);
+    await promiseWithMailTimeout(
+      "sendgrid_send",
+      sendViaSendGrid(recipient, subject, html, textPlain)
+    );
     return { skipped: false, via: "sendgrid" };
   }
 
@@ -454,18 +497,28 @@ async function sendParentEmail(to, subject, html, textPlain) {
     return tryChain([attemptSendGrid, attemptResend, attemptSmtp]);
   }
 
-  // auto: prefer SMTP when credentials exist — Resend "onboarding@resend.dev" cannot deliver
-  // to arbitrary parent inboxes; Gmail/SMTP sends to the real parent address.
+  /**
+   * auto: transactional APIs often work more reliably from cloud hosts than consumer Gmail SMTP.
+   * If RESEND_* or SENDGRID_* is set and SAFETY_MAIL_SMTP_FIRST is not "1", try APIs before SMTP so
+   * a flaky Gmail/session does not exhaust the parent's patience (timeouts still bound each attempt).
+   */
   let smtpReady = false;
   try {
     smtpReady = !!getSmtpPingDiagnostics().smtp_ready;
   } catch (_e) {
     smtpReady = false;
   }
-  const fns = smtpReady
-    ? [attemptSmtp, attemptResend, attemptSendGrid]
-    : [attemptResend, attemptSendGrid, attemptSmtp];
-  return tryChain(fns);
+  const hasResend = !!process.env.RESEND_API_KEY?.trim();
+  const hasSg = !!String(process.env.SENDGRID_API_KEY || "").trim();
+  const apisReady = hasResend || hasSg;
+  const smtpFirst =
+    process.env.SAFETY_MAIL_SMTP_FIRST === "1" ||
+    (smtpReady && !apisReady && process.env.SAFETY_MAIL_APIS_FIRST !== "1");
+
+  if (smtpFirst) {
+    return tryChain([attemptSmtp, attemptResend, attemptSendGrid]);
+  }
+  return tryChain([attemptResend, attemptSendGrid, attemptSmtp]);
 }
 
 // GET /api/safety/ping — verify DB + mail config (no auth; for deploy checks only)
@@ -493,6 +546,12 @@ router.get("/ping", async (_req, res) => {
       resend_api_key_set: !!String(process.env.RESEND_API_KEY || "").trim(),
       sendgrid_api_key_set: !!String(process.env.SENDGRID_API_KEY || "").trim(),
       email_provider: String(process.env.EMAIL_PROVIDER || "auto").trim() || "auto",
+      mail_timeout_ms_default: MAIL_TRANSPORT_TIMEOUT_MS,
+      auto_mail_order_hint:
+        mail.smtp_ready && !String(process.env.RESEND_API_KEY || "").trim() &&
+        !String(process.env.SENDGRID_API_KEY || "").trim()
+          ? "SMTP only — no Resend/SendGrid keys."
+          : "If EMAIL_PROVIDER is auto and Resend or SendGrid is configured, those run before SMTP (override with SAFETY_MAIL_SMTP_FIRST=1).",
     });
   } catch (err) {
     console.error("[safety] ping", err);
@@ -585,7 +644,9 @@ router.post("/report-flagged-search", async (req, res) => {
         ok: true,
         logged: false,
         deduped: true,
-        message: "same query recently; skip insert and notifications",
+        message:
+          "Same normalized search was already stored within the last few minutes — no duplicate row/email.",
+        hint: "Wait 3+ minutes or test with different wording so the alert pipeline runs again.",
       });
     }
 
@@ -706,6 +767,13 @@ router.post("/report-flagged-search", async (req, res) => {
       pushResult = { sent: false, error: String(pushErr?.message || pushErr).slice(0, 400) };
     }
 
+    let mailDiag = null;
+    try {
+      mailDiag = getSmtpPingDiagnostics();
+    } catch (_e) {
+      mailDiag = {};
+    }
+
     return res.json({
       ok: true,
       logged: true,
@@ -721,6 +789,12 @@ router.post("/report-flagged-search", async (req, res) => {
             return `${(loc || "?").slice(0, 1)}***@${dom}`;
           })()
         : null,
+      mail_env: {
+        smtp_ready: !!mailDiag.smtp_ready,
+        resend_api_key_set: !!String(process.env.RESEND_API_KEY || "").trim(),
+        sendgrid_api_key_set: !!String(process.env.SENDGRID_API_KEY || "").trim(),
+        email_provider: String(process.env.EMAIL_PROVIDER || "auto").trim() || "auto",
+      },
       push_sent: !!pushResult.sent,
       push_skipped: pushResult.skipped || null,
       push_error: pushResult.error || null,
