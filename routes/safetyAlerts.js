@@ -3,7 +3,7 @@ const router = express.Router();
 const db = require("../db");
 const firebaseAdmin = require("../firebaseAdmin");
 const { sendParentNotificationPush } = require("../fcmReminders");
-const { resolveSmtpUser, getTransporter, getSmtpPingDiagnostics } = require("../smtpEnv");
+const { resolveSmtpUser, sendConfiguredSmtpMail, getSmtpPingDiagnostics } = require("../smtpEnv");
 
 /** Default substring checks (lowercase). Extend via env BAD_SEARCH_PHRASES=comma,separated */
 const DEFAULT_BLOCKED_PHRASES = [
@@ -475,6 +475,14 @@ function deliveryHintWhenEmailSkipped(parentEmailNorm, emailSent, emailErrorRaw)
   if (!parentEmailNorm) {
     return "Open Kidora parent app while signed in to sync Firebase email into MySQL, or ensure firebase_uid matches the Firebase project.";
   }
+  try {
+    const diag = getSmtpPingDiagnostics();
+    if (diag.smtp_identity_warning) {
+      return diag.smtp_identity_warning;
+    }
+  } catch (_e) {
+    // ignore
+  }
   const err = String(emailErrorRaw || "").toLowerCase();
   const from = String(process.env.RESEND_FROM || "").toLowerCase();
   if (from.includes("onboarding@resend.dev") || from.includes("@resend.dev")) {
@@ -514,7 +522,7 @@ function deliveryHintWhenEmailSkipped(parentEmailNorm, emailSent, emailErrorRaw)
     resolveBrevoApiKey() === "" &&
     String(process.env.SENDGRID_API_KEY || "").trim() === ""
   ) {
-    return "No RESEND_API_KEY, BREVO_API_KEY or SENDGRID_API_KEY — only SMTP runs; Gmail from cloud often fails. Add a transactional API key + verified sender, or SAFETY_EMAIL_WEBHOOK_URL to relay alerts.";
+    return "Render + Gmail SMTP with no transactional API keys: inbox delivery is unreliable. Prefer RESEND_API_KEY + verified RESEND_FROM (resend.com). This server retries Gmail 465 vs 587 on transient SMTP errors automatically (GMAIL_SMTP_ALT_RETRY=0 to disable).";
   }
   return "See Render/host logs line [safety] all mail transports failed… and email_error in this JSON.";
 }
@@ -574,11 +582,7 @@ async function resolveParentRecipientEmail(row) {
 
 /** Gmail / SMTP: From address is SMTP_FROM (or SMTP_USER). Parents see "Kidora <kidoraapp06@gmail.com>" when using defaults. */
 async function sendViaConfiguredSmtp(to, subject, html, textPlain) {
-  const tx = getTransporter();
   const fromRaw = process.env.SMTP_FROM?.trim() || resolveSmtpUser() || "";
-  if (!tx) {
-    return { skipped: true, reason: "no_smtp_transport" };
-  }
   if (!fromRaw) {
     return { skipped: true, reason: "no_smtp_from_set_SMTP_FROM_or_SMTP_USER" };
   }
@@ -599,8 +603,17 @@ async function sendViaConfiguredSmtp(to, subject, html, textPlain) {
   if (textPlain && String(textPlain).trim()) {
     mail.text = String(textPlain);
   }
-  const info = await promiseWithMailTimeout("smtp_send", tx.sendMail(mail));
-  return { skipped: false, via: "smtp", messageId: info.messageId };
+  try {
+    const info = await promiseWithMailTimeout(
+      "smtp_send",
+      sendConfiguredSmtpMail(mail)
+    );
+    return { skipped: false, via: "smtp", messageId: info.messageId };
+  } catch (e) {
+    const msg = String(e?.message || e).slice(0, 400);
+    console.warn("[safety] SMTP send failed:", msg);
+    return { skipped: true, reason: msg };
+  }
 }
 
 /**
