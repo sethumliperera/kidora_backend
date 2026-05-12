@@ -15,9 +15,7 @@ console.log(
 );
 
 const { logSmtpStartup } = require("./smtpEnv");
-const { logMailStartup } = require("./mailDelivery");
 logSmtpStartup();
-logMailStartup();
 
 // ===============================
 // IMPORTS
