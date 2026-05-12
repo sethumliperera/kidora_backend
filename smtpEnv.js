@@ -85,6 +85,9 @@ function getTransporter() {
     transporter = nodemailer.createTransport({
       service: "gmail",
       auth,
+      connectionTimeout: 20000,
+      greetingTimeout: 20000,
+      socketTimeout: 45000,
     });
     return transporter;
   }
@@ -108,6 +111,7 @@ function getTransporter() {
     requireTLS: !secure && port === 587,
     connectionTimeout: 20000,
     greetingTimeout: 20000,
+    socketTimeout: 45000,
   });
   return transporter;
 }
