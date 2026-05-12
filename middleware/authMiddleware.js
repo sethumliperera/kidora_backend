@@ -48,21 +48,11 @@ const verifyToken = async (req, res, next) => {
       return res.status(404).json({ message: "Parent profile not found in database. Please contact support or re-register." });
     }
 
-    const userRow = results[0];
-    const userId = userRow.id;
-    const tokenEmail = decodedToken.email ? String(decodedToken.email).trim() : "";
-    if (tokenEmail && tokenEmail.includes("@")) {
-      const rowEmail = userRow.email ? String(userRow.email).trim() : "";
-      if (!rowEmail || rowEmail.toLowerCase() !== tokenEmail.toLowerCase()) {
-        await db.query("UPDATE users SET email = ? WHERE id = ?", [tokenEmail, userId]);
-      }
-    }
-
     // ✅ Map user data to request
     req.user = {
-      id: userId,
+      id: results[0].id,
       firebase_uid: decodedToken.uid,
-      email: decodedToken.email || userRow.email,
+      email: decodedToken.email
     };
 
     console.log("Authenticated User ID:", req.user.id);
