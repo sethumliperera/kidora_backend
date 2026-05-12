@@ -215,6 +215,29 @@ const MAIL_TRANSPORT_TIMEOUT_MS = Math.min(
   )
 );
 
+/** BOM / quotes often appear when pasting secrets in hosting dashboards. */
+function stripSecretEnv(raw) {
+  if (raw == null) return "";
+  let s = String(raw).replace(/^\ufeff/, "").trim();
+  s = s.replace(/\u200b/g, "").replace(/\s+$/gm, "").trim();
+  if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
+    s = s.slice(1, -1).trim();
+  }
+  return s;
+}
+
+/**
+ * Brevo transactional API expects `api-key`. Keys are commonly set as BREVO_API_KEY or legacy SENDINBLUE_API_KEY.
+ * @returns {string}
+ */
+function resolveBrevoApiKey() {
+  for (const envName of ["BREVO_API_KEY", "SENDINBLUE_API_KEY"]) {
+    const v = stripSecretEnv(process.env[envName]);
+    if (v) return v;
+  }
+  return "";
+}
+
 /** Avoid one slow/hung SMTP connection blocking fallback mailers. */
 function promiseWithMailTimeout(label, promise) {
   let timer;
@@ -281,8 +304,12 @@ async function sendViaResend(to, subject, html, textPlain) {
  * https://developers.brevo.com/reference/sendtransacemail
  */
 async function sendViaBrevo(to, subject, html, textPlain) {
-  const key = process.env.BREVO_API_KEY?.trim();
-  if (!key) throw new Error("BREVO_API_KEY missing");
+  const key = resolveBrevoApiKey();
+  if (!key) {
+    throw new Error(
+      "Brevo API key missing — set BREVO_API_KEY or SENDINBLUE_API_KEY on the API host."
+    );
+  }
 
   let senderEmail = process.env.BREVO_SENDER_EMAIL?.trim();
   if (!senderEmail) {
@@ -318,6 +345,7 @@ async function sendViaBrevo(to, subject, html, textPlain) {
   const res = await fetch("https://api.brevo.com/v3/smtp/email", {
     method: "POST",
     headers: {
+      accept: "application/json",
       "api-key": key,
       "Content-Type": "application/json",
     },
@@ -327,7 +355,16 @@ async function sendViaBrevo(to, subject, html, textPlain) {
 
   if (!res.ok) {
     const body = await res.text();
-    throw new Error(`Brevo HTTP ${res.status}: ${body.slice(0, 500)}`);
+    const preview = body.slice(0, 500);
+    if (
+      res.status === 401 &&
+      /authentication not found|\"code\"\s*:\s*\"unauthorized\"/i.test(preview)
+    ) {
+      throw new Error(
+        `Brevo HTTP 401: ${preview} — Brevo did not receive a valid api-key header. Regenerate key at https://app.brevo.com/settings/keys/api and set BREVO_API_KEY (no quotes) on the same Web Service that runs kidora-backend. SENDINBLUE_API_KEY is accepted as an alias.`
+      );
+    }
+    throw new Error(`Brevo HTTP ${res.status}: ${preview}`);
   }
 }
 
@@ -460,16 +497,21 @@ function deliveryHintWhenEmailSkipped(parentEmailNorm, emailSent, emailErrorRaw)
     return "SAFETY_EMAIL_WEBHOOK_URL returned an error — fix the Zapier/Make/n8n scenario or rely on RESEND_/BREVO_/SENDGRID for direct transactional email.";
   }
   if (
+    err.includes("brevo http 401") &&
+    (err.includes("authentication not found") || err.includes("not receive a valid api-key"))
+  ) {
+    return "Brevo 401 — API key missing or stripped. On Render/host set BREVO_API_KEY=SENDIB_...(no quotes/spaces); alias SENDINBLUE_API_KEY works. Regenerate under Brevo → SMTP & API → API keys, redeploy.";
+  }
+  if (
     err.includes("brevo http") ||
     err.includes("invalid sender") ||
-    err.includes("unauthorized") ||
     err.includes("not allowed")
   ) {
-    return "Brevo rejected send: verify BREVO_SENDER_EMAIL/domain in brevo.com and check BREVO_API_KEY scopes.";
+    return "Brevo rejected send: verify BREVO_SENDER_EMAIL/domain in brevo.com and regenerate BREVO_API_KEY if needed.";
   }
   if (
     String(process.env.RESEND_API_KEY || "").trim() === "" &&
-    String(process.env.BREVO_API_KEY || "").trim() === "" &&
+    resolveBrevoApiKey() === "" &&
     String(process.env.SENDGRID_API_KEY || "").trim() === ""
   ) {
     return "No RESEND_API_KEY, BREVO_API_KEY or SENDGRID_API_KEY — only SMTP runs; Gmail from cloud often fails. Add a transactional API key + verified sender, or SAFETY_EMAIL_WEBHOOK_URL to relay alerts.";
@@ -567,7 +609,7 @@ async function sendViaConfiguredSmtp(to, subject, html, textPlain) {
  */
 function orderSafetyMailChainHints() {
   const hasResend = !!String(process.env.RESEND_API_KEY || "").trim();
-  const hasBrevo = !!String(process.env.BREVO_API_KEY || "").trim();
+  const hasBrevo = !!resolveBrevoApiKey();
   const hasSg = !!String(process.env.SENDGRID_API_KEY || "").trim();
   const apisReady = hasResend || hasBrevo || hasSg;
   let smtpReady = false;
@@ -627,7 +669,7 @@ async function sendParentEmail(to, subject, html, textPlain) {
   }
 
   async function attemptBrevo() {
-    if (!process.env.BREVO_API_KEY?.trim()) {
+    if (!resolveBrevoApiKey()) {
       return { skipped: true, reason: "no_brevo_api_key" };
     }
     await promiseWithMailTimeout(
@@ -688,6 +730,16 @@ async function sendParentEmail(to, subject, html, textPlain) {
   const chainApiFirst = [attemptResend, attemptBrevo, attemptSendGrid, attemptSmtp];
   const chainSmtpFirst = [attemptSmtp, attemptResend, attemptBrevo, attemptSendGrid];
 
+  /** Nodemailer only (smtpEnv); skips Resend/Brevo/SendGrid. SAFETY_EMAIL_WEBHOOK_URL still applies after SMTP fails. */
+  const smtpOnly =
+    process.env.SAFETY_MAIL_SMTP_ONLY === "1" || prefer === "smtp_only";
+  if (smtpOnly) {
+    console.log(
+      "[safety] SMTP-only mode — transactional HTTP mailers skipped; using configured SMTP transport only"
+    );
+    return runMailChain([attemptSmtp]);
+  }
+
   if (prefer === "smtp") {
     return runMailChain(chainSmtpFirst);
   }
@@ -741,21 +793,27 @@ router.get("/ping", async (_req, res) => {
     } catch (e) {
       safety_stats = { error: String(e?.message || e).slice(0, 200) };
     }
+    const ep = String(process.env.EMAIL_PROVIDER || "auto").toLowerCase().trim() || "auto";
+    const smtpOnlyEnforced =
+      process.env.SAFETY_MAIL_SMTP_ONLY === "1" || ep === "smtp_only";
+
     return res.json({
       ok: true,
       db: true,
       ...safety_stats,
       ...mail,
       resend_api_key_set: !!String(process.env.RESEND_API_KEY || "").trim(),
-      brevo_api_key_set: !!String(process.env.BREVO_API_KEY || "").trim(),
+      brevo_api_key_set: !!resolveBrevoApiKey(),
       sendgrid_api_key_set: !!String(process.env.SENDGRID_API_KEY || "").trim(),
       safety_email_webhook_set: !!String(process.env.SAFETY_EMAIL_WEBHOOK_URL || "").trim(),
       email_provider: String(process.env.EMAIL_PROVIDER || "auto").trim() || "auto",
+      safety_mail_smtp_only: smtpOnlyEnforced,
       mail_timeout_ms_default: MAIL_TRANSPORT_TIMEOUT_MS,
-      auto_mail_order_hint:
-        mail.smtp_ready &&
+      auto_mail_order_hint: smtpOnlyEnforced
+        ? "SMTP-only: SAFETY_MAIL_SMTP_ONLY=1 or EMAIL_PROVIDER=smtp_only — Resend/Brevo/SendGrid are not used; webhook fallback still applies if SAFETY_EMAIL_WEBHOOK_URL is set."
+        : mail.smtp_ready &&
         !String(process.env.RESEND_API_KEY || "").trim() &&
-        !String(process.env.BREVO_API_KEY || "").trim() &&
+        !resolveBrevoApiKey() &&
         !String(process.env.SENDGRID_API_KEY || "").trim()
           ? "SMTP only — no Resend/Brevo/SendGrid keys. SAFETY_EMAIL_WEBHOOK_URL is tried after transports fail."
           : (() => {
@@ -765,7 +823,7 @@ router.get("/ping", async (_req, res) => {
                 .trim() || "auto";
               const apis =
                 !!String(process.env.RESEND_API_KEY || "").trim() ||
-                !!String(process.env.BREVO_API_KEY || "").trim() ||
+                !!resolveBrevoApiKey() ||
                 !!String(process.env.SENDGRID_API_KEY || "").trim();
               if (
                 prov === "gmail" &&
@@ -1020,8 +1078,11 @@ router.post("/report-flagged-search", async (req, res) => {
         : null,
       mail_env: {
         smtp_ready: !!mailDiag.smtp_ready,
+        safety_mail_smtp_only:
+          process.env.SAFETY_MAIL_SMTP_ONLY === "1" ||
+          String(process.env.EMAIL_PROVIDER || "").toLowerCase().trim() === "smtp_only",
         resend_api_key_set: !!String(process.env.RESEND_API_KEY || "").trim(),
-        brevo_api_key_set: !!String(process.env.BREVO_API_KEY || "").trim(),
+        brevo_api_key_set: !!resolveBrevoApiKey(),
         sendgrid_api_key_set: !!String(process.env.SENDGRID_API_KEY || "").trim(),
         safety_email_webhook_set: !!String(process.env.SAFETY_EMAIL_WEBHOOK_URL || "").trim(),
         email_provider: String(process.env.EMAIL_PROVIDER || "auto").trim() || "auto",
