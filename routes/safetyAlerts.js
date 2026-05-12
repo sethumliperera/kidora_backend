@@ -205,7 +205,7 @@ function buildFlaggedSearchEmailPlain({
 
 /**
  * Resend — optional alternative to Gmail SMTP (https://resend.com).
- * Only used if RESEND_API_KEY is set and EMAIL_PROVIDER != gmail/smtp.
+ * Resend/Brevo/SendGrid/Webhook are chained from sendParentEmail.
  */
 const MAIL_TRANSPORT_TIMEOUT_MS = Math.min(
   120000,
@@ -274,6 +274,109 @@ async function sendViaResend(to, subject, html, textPlain) {
     const body = await res.text();
     throw new Error(`Resend HTTP ${res.status}: ${body.slice(0, 500)}`);
   }
+}
+
+/**
+ * Brevo (formerly Sendinblue) REST API — transactional email from datacenter IPs.
+ * https://developers.brevo.com/reference/sendtransacemail
+ */
+async function sendViaBrevo(to, subject, html, textPlain) {
+  const key = process.env.BREVO_API_KEY?.trim();
+  if (!key) throw new Error("BREVO_API_KEY missing");
+
+  let senderEmail = process.env.BREVO_SENDER_EMAIL?.trim();
+  if (!senderEmail) {
+    const raw = process.env.SMTP_FROM?.trim() || resolveSmtpUser() || "";
+    const angled = raw.match(/<([^>]+)>/);
+    senderEmail = angled ? angled[1].trim() : raw.trim();
+  }
+  if (!senderEmail || !senderEmail.includes("@")) {
+    throw new Error(
+      "Set BREVO_SENDER_EMAIL (verified sender in Brevo dashboard) or SMTP_FROM / SMTP_USER with an email address."
+    );
+  }
+  const senderName = process.env.BREVO_SENDER_NAME?.trim() || "Kidora";
+
+  const payload = {
+    sender: { name: senderName, email: senderEmail },
+    to: [{ email: to }],
+    subject,
+    htmlContent: html,
+    headers: {
+      "X-Priority": "1",
+      Importance: "high",
+    },
+  };
+  if (textPlain && String(textPlain).trim()) {
+    payload.textContent = String(textPlain);
+  }
+
+  const bvAc =
+    typeof AbortSignal !== "undefined" && AbortSignal.timeout
+      ? AbortSignal.timeout(MAIL_TRANSPORT_TIMEOUT_MS)
+      : undefined;
+  const res = await fetch("https://api.brevo.com/v3/smtp/email", {
+    method: "POST",
+    headers: {
+      "api-key": key,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+    signal: bvAc,
+  });
+
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Brevo HTTP ${res.status}: ${body.slice(0, 500)}`);
+  }
+}
+
+/**
+ * Optional Zapier/Make/n8n relay: POST JSON payload when SMTP + APIs all fail or are unset.
+ */
+async function attemptSafetyEmailWebhook(recipientNorm, subject, html, textPlain) {
+  const url = String(process.env.SAFETY_EMAIL_WEBHOOK_URL || "").trim();
+  if (!url) {
+    return { skipped: true, reason: "no_webhook_url" };
+  }
+
+  try {
+    await promiseWithMailTimeout(
+      "safety_webhook",
+      (async () => {
+        const headers = { "Content-Type": "application/json" };
+        const sec = String(process.env.SAFETY_EMAIL_WEBHOOK_SECRET || "").trim();
+        if (sec) headers.Authorization = `Bearer ${sec}`;
+        const ac =
+          typeof AbortSignal !== "undefined" && AbortSignal.timeout
+            ? AbortSignal.timeout(MAIL_TRANSPORT_TIMEOUT_MS)
+            : undefined;
+        const res = await fetch(url, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            kind: "kidora_safety_parent_email",
+            to: recipientNorm,
+            subject,
+            html,
+            text: textPlain ? String(textPlain) : "",
+          }),
+          signal: ac,
+        });
+        if (!res.ok) {
+          const body = await res.text();
+          throw new Error(`Webhook HTTP ${res.status}: ${body.slice(0, 400)}`);
+        }
+      })()
+    );
+  } catch (e) {
+    const msg = e?.message || String(e);
+    console.warn("[safety] SAFETY_EMAIL_WEBHOOK_URL failed:", msg.slice(0, 300));
+    return { skipped: true, reason: `webhook:${msg.slice(0, 200)}` };
+  }
+
+  console.log("[safety] SAFETY_EMAIL_WEBHOOK_URL accepted POST (relay may send inbox mail separately)");
+  return { skipped: false, via: "webhook" };
 }
 
 /**
@@ -351,13 +454,25 @@ function deliveryHintWhenEmailSkipped(parentEmailNorm, emailSent, emailErrorRaw)
     err.includes("timed out") ||
     err.includes("econn refused")
   ) {
-    return "Gmail SMTP from Render/cloud often fails first. Add RESEND_API_KEY + verified RESEND_FROM; with recent server code, APIs run before Gmail even if EMAIL_PROVIDER=gmail. Or use EMAIL_PROVIDER=auto.";
+    return "Gmail SMTP from Render/cloud often fails first. Add RESEND_API_KEY (+ RESEND_FROM) or BREVO_API_KEY (+ BREVO_SENDER_EMAIL); transactional APIs run before Gmail even if EMAIL_PROVIDER=gmail. Or set EMAIL_PROVIDER=auto.";
+  }
+  if (err.includes("webhook:http") || err.includes("webhook:")) {
+    return "SAFETY_EMAIL_WEBHOOK_URL returned an error — fix the Zapier/Make/n8n scenario or rely on RESEND_/BREVO_/SENDGRID for direct transactional email.";
+  }
+  if (
+    err.includes("brevo http") ||
+    err.includes("invalid sender") ||
+    err.includes("unauthorized") ||
+    err.includes("not allowed")
+  ) {
+    return "Brevo rejected send: verify BREVO_SENDER_EMAIL/domain in brevo.com and check BREVO_API_KEY scopes.";
   }
   if (
     String(process.env.RESEND_API_KEY || "").trim() === "" &&
+    String(process.env.BREVO_API_KEY || "").trim() === "" &&
     String(process.env.SENDGRID_API_KEY || "").trim() === ""
   ) {
-    return "No RESEND_API_KEY or SENDGRID_API_KEY on API host — only SMTP applies; fix Gmail app password/host or add Resend.";
+    return "No RESEND_API_KEY, BREVO_API_KEY or SENDGRID_API_KEY — only SMTP runs; Gmail from cloud often fails. Add a transactional API key + verified sender, or SAFETY_EMAIL_WEBHOOK_URL to relay alerts.";
   }
   return "See Render/host logs line [safety] all mail transports failed… and email_error in this JSON.";
 }
@@ -447,13 +562,14 @@ async function sendViaConfiguredSmtp(to, subject, html, textPlain) {
 }
 
 /**
- * When Resend/SendGrid keys exist and SAFETY_MAIL_SMTP_FIRST is not set, transactional APIs run first.
+ * When Resend/Brevo/SendGrid keys exist and SAFETY_MAIL_SMTP_FIRST is not set, transactional APIs run first.
  * Mirrors legacy auto branch; reused for EMAIL_PROVIDER=gmail so PaaS is not blocked on Gmail SMTP.
  */
 function orderSafetyMailChainHints() {
   const hasResend = !!String(process.env.RESEND_API_KEY || "").trim();
+  const hasBrevo = !!String(process.env.BREVO_API_KEY || "").trim();
   const hasSg = !!String(process.env.SENDGRID_API_KEY || "").trim();
-  const apisReady = hasResend || hasSg;
+  const apisReady = hasResend || hasBrevo || hasSg;
   let smtpReady = false;
   try {
     smtpReady = !!getSmtpPingDiagnostics().smtp_ready;
@@ -510,6 +626,17 @@ async function sendParentEmail(to, subject, html, textPlain) {
     return { skipped: false, via: "sendgrid" };
   }
 
+  async function attemptBrevo() {
+    if (!process.env.BREVO_API_KEY?.trim()) {
+      return { skipped: true, reason: "no_brevo_api_key" };
+    }
+    await promiseWithMailTimeout(
+      "brevo_send",
+      sendViaBrevo(recipient, subject, html, textPlain)
+    );
+    return { skipped: false, via: "brevo" };
+  }
+
   /**
    * Try transports in order until one succeeds. Previously EMAIL_PROVIDER=gmail
    * returned immediately when SMTP was misconfigured, never trying Resend/SendGrid.
@@ -545,37 +672,56 @@ async function sendParentEmail(to, subject, html, textPlain) {
     };
   }
 
+  async function runMailChain(fns) {
+    const inner = await tryChain(fns);
+    if (!inner.skipped) return inner;
+    const hook = await attemptSafetyEmailWebhook(recipient, subject, html, textPlain);
+    if (!hook.skipped) return hook;
+    if (hook.reason === "no_webhook_url") return inner;
+    return {
+      skipped: true,
+      reason:
+        `${inner.reason || "no_mailer_config"} | ${hook.reason}`.slice(0, 500),
+    };
+  }
+
+  const chainApiFirst = [attemptResend, attemptBrevo, attemptSendGrid, attemptSmtp];
+  const chainSmtpFirst = [attemptSmtp, attemptResend, attemptBrevo, attemptSendGrid];
+
   if (prefer === "smtp") {
-    return tryChain([attemptSmtp, attemptResend, attemptSendGrid]);
+    return runMailChain(chainSmtpFirst);
   }
 
   if (prefer === "gmail") {
     if (!order.apisReady) {
       console.warn(
-        "[safety] EMAIL_PROVIDER=gmail with no RESEND_/SENDGRID_ keys — only SMTP will run; Gmail SMTP from Render often fails. Add RESEND_API_KEY + verified RESEND_FROM or set EMAIL_PROVIDER=auto."
+        "[safety] EMAIL_PROVIDER=gmail with no RESEND_/BREVO_/SENDGRID_ keys — only SMTP will run; Gmail SMTP from Render often fails. Add RESEND_API_KEY+BREVO_/SENDGRID_ + verified sender or EMAIL_PROVIDER=auto."
       );
-      return tryChain([attemptSmtp, attemptResend, attemptSendGrid]);
+      return runMailChain(chainSmtpFirst);
     }
     console.log(
-      "[safety] EMAIL_PROVIDER=gmail but transactional API keys exist — trying Resend/SendGrid before Gmail SMTP."
+      "[safety] EMAIL_PROVIDER=gmail but transactional API keys exist — trying APIs before Gmail SMTP."
     );
     if (order.smtpFirst) {
-      return tryChain([attemptSmtp, attemptResend, attemptSendGrid]);
+      return runMailChain(chainSmtpFirst);
     }
-    return tryChain([attemptResend, attemptSendGrid, attemptSmtp]);
+    return runMailChain(chainApiFirst);
   }
 
   if (prefer === "resend") {
-    return tryChain([attemptResend, attemptSendGrid, attemptSmtp]);
+    return runMailChain([attemptResend, attemptBrevo, attemptSendGrid, attemptSmtp]);
+  }
+  if (prefer === "brevo") {
+    return runMailChain([attemptBrevo, attemptResend, attemptSendGrid, attemptSmtp]);
   }
   if (prefer === "sendgrid") {
-    return tryChain([attemptSendGrid, attemptResend, attemptSmtp]);
+    return runMailChain([attemptSendGrid, attemptResend, attemptBrevo, attemptSmtp]);
   }
 
   if (order.smtpFirst) {
-    return tryChain([attemptSmtp, attemptResend, attemptSendGrid]);
+    return runMailChain(chainSmtpFirst);
   }
-  return tryChain([attemptResend, attemptSendGrid, attemptSmtp]);
+  return runMailChain(chainApiFirst);
 }
 
 // GET /api/safety/ping — verify DB + mail config (no auth; for deploy checks only)
@@ -601,13 +747,17 @@ router.get("/ping", async (_req, res) => {
       ...safety_stats,
       ...mail,
       resend_api_key_set: !!String(process.env.RESEND_API_KEY || "").trim(),
+      brevo_api_key_set: !!String(process.env.BREVO_API_KEY || "").trim(),
       sendgrid_api_key_set: !!String(process.env.SENDGRID_API_KEY || "").trim(),
+      safety_email_webhook_set: !!String(process.env.SAFETY_EMAIL_WEBHOOK_URL || "").trim(),
       email_provider: String(process.env.EMAIL_PROVIDER || "auto").trim() || "auto",
       mail_timeout_ms_default: MAIL_TRANSPORT_TIMEOUT_MS,
       auto_mail_order_hint:
-        mail.smtp_ready && !String(process.env.RESEND_API_KEY || "").trim() &&
+        mail.smtp_ready &&
+        !String(process.env.RESEND_API_KEY || "").trim() &&
+        !String(process.env.BREVO_API_KEY || "").trim() &&
         !String(process.env.SENDGRID_API_KEY || "").trim()
-          ? "SMTP only — no Resend/SendGrid keys."
+          ? "SMTP only — no Resend/Brevo/SendGrid keys. SAFETY_EMAIL_WEBHOOK_URL is tried after transports fail."
           : (() => {
               const ord = orderSafetyMailChainHints();
               const prov = String(process.env.EMAIL_PROVIDER || "auto")
@@ -615,17 +765,18 @@ router.get("/ping", async (_req, res) => {
                 .trim() || "auto";
               const apis =
                 !!String(process.env.RESEND_API_KEY || "").trim() ||
+                !!String(process.env.BREVO_API_KEY || "").trim() ||
                 !!String(process.env.SENDGRID_API_KEY || "").trim();
               if (
                 prov === "gmail" &&
                 apis &&
                 !ord.smtpFirst
               ) {
-                return "EMAIL_PROVIDER=gmail with Resend/SendGrid configured: APIs send first (same as auto). SAFETY_MAIL_SMTP_FIRST=1 forces Gmail SMTP first.";
+                return "EMAIL_PROVIDER=gmail with transactional API keys (Resend/Brevo/SendGrid): APIs send first. SAFETY_MAIL_SMTP_FIRST=1 forces SMTP first.";
               }
               return ord.smtpFirst
-                ? "Order: SMTP first, then APIs (SAFETY_MAIL_APIS_FIRST=1 or remove SMTP to prefer APIs)."
-                : "Order: Resend → SendGrid → SMTP (unless SAFETY_MAIL_SMTP_FIRST=1). EMAIL_PROVIDER=gmail uses this too when API keys exist.";
+                ? "Order: SMTP first, then Resend → Brevo → SendGrid. SAFETY_MAIL_APIS_FIRST=1 prefers APIs."
+                : "Order: Resend → Brevo → SendGrid → SMTP (unless SAFETY_MAIL_SMTP_FIRST=1). After all fail, SAFETY_EMAIL_WEBHOOK_URL if set.";
             })(),
     });
   } catch (err) {
@@ -772,6 +923,7 @@ router.post("/report-flagged-search", async (req, res) => {
 
     let emailSent = false;
     let emailError = null;
+    let emailVia = null;
     if (parentEmailNorm) {
       const html = buildFlaggedSearchEmailHtml({
         childName: labelForParent,
@@ -796,6 +948,7 @@ router.post("/report-flagged-search", async (req, res) => {
       try {
         const mailResult = await sendParentEmail(parentEmailNorm, subject, html, plain);
         emailSent = !mailResult.skipped;
+        if (!mailResult.skipped) emailVia = mailResult.via || null;
         if (mailResult.skipped) {
           emailError = mailResult.reason || "skipped";
         }
@@ -854,6 +1007,7 @@ router.post("/report-flagged-search", async (req, res) => {
       logged: true,
       alert_id: alertId,
       email_sent: emailSent,
+      email_via: emailVia,
       email_error: emailError,
       email_skipped: !parentEmailNorm,
       parent_email_source: resolvedRecipient.source,
@@ -867,7 +1021,9 @@ router.post("/report-flagged-search", async (req, res) => {
       mail_env: {
         smtp_ready: !!mailDiag.smtp_ready,
         resend_api_key_set: !!String(process.env.RESEND_API_KEY || "").trim(),
+        brevo_api_key_set: !!String(process.env.BREVO_API_KEY || "").trim(),
         sendgrid_api_key_set: !!String(process.env.SENDGRID_API_KEY || "").trim(),
+        safety_email_webhook_set: !!String(process.env.SAFETY_EMAIL_WEBHOOK_URL || "").trim(),
         email_provider: String(process.env.EMAIL_PROVIDER || "auto").trim() || "auto",
         delivery_hint:
           deliveryHintWhenEmailSkipped(parentEmailNorm, emailSent, emailError) || undefined,
