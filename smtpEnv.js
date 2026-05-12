@@ -42,19 +42,8 @@ function resolveSmtpUser() {
   return pickFirstEnv(SMTP_USER_ENV_KEYS).value;
 }
 
-function normalizeSecret(value) {
-  let v = String(value || "").trim();
-  if (
-    (v.startsWith('"') && v.endsWith('"')) ||
-    (v.startsWith("'") && v.endsWith("'"))
-  ) {
-    v = v.slice(1, -1).trim();
-  }
-  return v.replace(/\s+/g, "");
-}
-
 function resolveSmtpPass() {
-  return normalizeSecret(pickFirstEnv(SMTP_PASS_ENV_KEYS).value);
+  return pickFirstEnv(SMTP_PASS_ENV_KEYS).value;
 }
 
 function resolveSmtpHostRaw() {
@@ -80,33 +69,6 @@ function shouldUseGmailServiceTransport() {
   return false;
 }
 
-function createGmailTransport(user, pass, overrides = {}) {
-  const host = resolveSmtpHostRaw().toLowerCase() || "smtp.gmail.com";
-  const port = parseInt(readEnvKey("SMTP_PORT").value || "587", 10);
-  const secureRaw = readEnvKey("SMTP_SECURE").value;
-  const secure =
-    secureRaw === "1" ||
-    String(secureRaw).toLowerCase() === "true" ||
-    port === 465;
-  return nodemailer.createTransport({
-    host,
-    port,
-    secure,
-    auth: { user, pass },
-    requireTLS: !secure && port === 587,
-    family: 4,
-    connectionTimeout: 20000,
-    greetingTimeout: 20000,
-    socketTimeout: 20000,
-    tls: { servername: host },
-    ...overrides,
-  });
-}
-
-function clearTransporter() {
-  transporter = null;
-}
-
 function getTransporter() {
   if (transporter) return transporter;
   const user = resolveSmtpUser();
@@ -117,9 +79,13 @@ function getTransporter() {
     );
     return null;
   }
+  const auth = { user, pass };
 
   if (shouldUseGmailServiceTransport()) {
-    transporter = createGmailTransport(user, pass);
+    transporter = nodemailer.createTransport({
+      service: "gmail",
+      auth,
+    });
     return transporter;
   }
 
@@ -138,95 +104,12 @@ function getTransporter() {
     host,
     port,
     secure,
-    auth: { user, pass },
+    auth,
     requireTLS: !secure && port === 587,
-    connectionTimeout: 30000,
-    greetingTimeout: 30000,
+    connectionTimeout: 20000,
+    greetingTimeout: 20000,
   });
   return transporter;
-}
-
-async function verifySmtpConnection() {
-  const user = resolveSmtpUser();
-  const pass = resolveSmtpPass();
-  if (!user || !pass) {
-    return { ok: false, error: "missing_smtp_credentials" };
-  }
-
-  const attempts = [];
-  if (shouldUseGmailServiceTransport()) {
-    attempts.push(createGmailTransport(user, pass));
-    attempts.push(
-      createGmailTransport(user, pass, {
-        host: "smtp.gmail.com",
-        port: 465,
-        secure: true,
-        requireTLS: false,
-      })
-    );
-  } else {
-    const tx = getTransporter();
-    if (tx) attempts.push(tx);
-  }
-
-  let lastError = null;
-  for (const tx of attempts) {
-    try {
-      await tx.verify();
-      transporter = tx;
-      return { ok: true };
-    } catch (err) {
-      lastError = err;
-    }
-  }
-
-  clearTransporter();
-  return {
-    ok: false,
-    error: String(lastError?.message || lastError || "smtp_verify_failed").slice(0, 300),
-  };
-}
-
-async function sendMailWithConfiguredTransport(mailOptions) {
-  const user = resolveSmtpUser();
-  const pass = resolveSmtpPass();
-  if (!user || !pass) {
-    return { skipped: true, reason: "missing_smtp_credentials" };
-  }
-
-  const attempts = [];
-  if (shouldUseGmailServiceTransport()) {
-    attempts.push(createGmailTransport(user, pass));
-    attempts.push(
-      createGmailTransport(user, pass, {
-        host: "smtp.gmail.com",
-        port: 465,
-        secure: true,
-        requireTLS: false,
-      })
-    );
-  } else {
-    const tx = getTransporter();
-    if (tx) attempts.push(tx);
-  }
-
-  if (!attempts.length) {
-    return { skipped: true, reason: "no_smtp_transport" };
-  }
-
-  let lastError = null;
-  for (const tx of attempts) {
-    try {
-      const info = await tx.sendMail(mailOptions);
-      transporter = tx;
-      return { skipped: false, via: "smtp", messageId: info.messageId };
-    } catch (err) {
-      lastError = err;
-    }
-  }
-
-  clearTransporter();
-  throw lastError || new Error("smtp_send_failed");
 }
 
 function getSmtpPingDiagnostics() {
@@ -269,7 +152,6 @@ function getSmtpPingDiagnostics() {
     email_provider: emailProvider || "auto",
     hint,
     on_render: onRender,
-    render_instance_type: process.env.RENDER_INSTANCE_TYPE || null,
     render_service_name: process.env.RENDER_SERVICE_NAME || null,
     render_external_url: process.env.RENDER_EXTERNAL_URL || null,
     render_service_id: process.env.RENDER_SERVICE_ID || null,
@@ -292,9 +174,6 @@ module.exports = {
   resolveSmtpPass,
   shouldUseGmailServiceTransport,
   getTransporter,
-  clearTransporter,
-  verifySmtpConnection,
-  sendMailWithConfiguredTransport,
   getSmtpPingDiagnostics,
   logSmtpStartup,
 };
