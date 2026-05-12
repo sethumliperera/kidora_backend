@@ -157,91 +157,37 @@ function buildFlaggedSearchEmailHtml({
 </body></html>`;
 }
 
-/**
- * Resend — optional alternative to Gmail SMTP (https://resend.com).
- * Only used if RESEND_API_KEY is set and EMAIL_PROVIDER != gmail/smtp.
- */
-async function sendViaResend(to, subject, html) {
-  const key = process.env.RESEND_API_KEY?.trim();
-  const from =
-    process.env.RESEND_FROM?.trim() ||
-    "Kidora <onboarding@resend.dev>";
-  if (!key) throw new Error("RESEND_API_KEY missing");
-
-  const res = await fetch("https://api.resend.com/emails", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${key}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      from,
-      to: [to],
-      subject,
-      html,
-      headers: {
-        "X-Priority": "1",
-        Importance: "high",
-      },
-    }),
-  });
-
-  if (!res.ok) {
-    const body = await res.text();
-    throw new Error(`Resend HTTP ${res.status}: ${body.slice(0, 500)}`);
-  }
-}
-
-/**
- * SendGrid Web API. Free tier ~100 emails/day for new accounts.
- */
-async function sendViaSendGrid(to, subject, html) {
-  const key = process.env.SENDGRID_API_KEY;
-  const fromEmail =
-    process.env.SENDGRID_FROM_EMAIL?.trim() ||
-    process.env.SMTP_FROM?.trim() ||
-    resolveSmtpUser();
-  if (!key) throw new Error("SENDGRID_API_KEY missing");
-  if (!fromEmail) {
-    throw new Error("Set SENDGRID_FROM_EMAIL (verified sender) or SMTP_FROM");
-  }
-
-  const res = await fetch("https://api.sendgrid.com/v3/mail/send", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${key}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      personalizations: [
-        {
-          to: [{ email: to }],
-          subject,
-          headers: {
-            "X-Priority": "1",
-            Importance: "high",
-            Priority: "urgent",
-          },
-        },
-      ],
-      from: { email: fromEmail, name: "Kidora" },
-      content: [{ type: "text/html", value: html }],
-      categories: ["kidora", "safety_alert"],
-    }),
-  });
-
-  if (!res.ok) {
-    const body = await res.text();
-    throw new Error(`SendGrid HTTP ${res.status}: ${body.slice(0, 500)}`);
-  }
-}
-
 /** Single recipient: parent of the child only. */
 function normalizeParentEmail(raw) {
   const s = String(raw || "").trim();
   if (!s || !s.includes("@")) return null;
   if (s.includes(",") || s.includes(";")) return null;
   return s;
+}
+
+function buildSmtpFailureHint(errorText, mail) {
+  const err = String(errorText || "").toLowerCase();
+  const onRender = !!mail.on_render;
+  const renderFree =
+    onRender &&
+    String(process.env.RENDER_INSTANCE_TYPE || "free").toLowerCase().includes("free");
+
+  if (err.includes("timeout") || err.includes("etimedout") || err.includes("econnrefused")) {
+    if (renderFree) {
+      return (
+        "Render free web services block outbound Gmail SMTP (ports 587/465). Upgrade kidora-api to a paid Render instance, or host the API on a provider that allows SMTP. Keep EMAIL_PROVIDER=gmail, SMTP_USER, and a Gmail App Password in SMTP_PASS."
+      );
+    }
+    return (
+      "This server cannot reach Gmail SMTP. Set SMTP_HOST=smtp.gmail.com, SMTP_PORT=587, SMTP_SECURE=false, EMAIL_PROVIDER=gmail, and use a Gmail App Password (not your normal password) in SMTP_PASS."
+    );
+  }
+
+  if (err.includes("invalid login") || err.includes("username and password") || err.includes("authentication")) {
+    return "Gmail rejected SMTP_USER/SMTP_PASS. Use a 16-character Google App Password with 2-Step Verification enabled; remove spaces from SMTP_PASS.";
+  }
+
+  return "Gmail SMTP is configured but login/send failed. Check SMTP_USER, SMTP_PASS (App Password), and redeploy kidora-api.";
 }
 
 /** Gmail / SMTP: From address is SMTP_FROM (or SMTP_USER). Parents see "Kidora <kidoraapp06@gmail.com>" when using defaults. */
@@ -274,63 +220,18 @@ async function sendParentEmail(to, subject, html) {
     return { skipped: true, reason: "invalid_email" };
   }
 
-  const prefer = (process.env.EMAIL_PROVIDER || "auto").toLowerCase().trim();
-  const smtpFirst = prefer === "smtp" || prefer === "gmail" || prefer === "auto";
-
-  async function tryApiProviders() {
-    if (process.env.RESEND_API_KEY?.trim()) {
-      await sendViaResend(recipient, subject, html);
-      console.log("[safety] email sent via Resend to", recipient);
-      return { skipped: false, via: "resend" };
+  try {
+    const smtp = await sendViaConfiguredSmtp(recipient, subject, html);
+    if (!smtp.skipped) {
+      console.log("[safety] email sent via SMTP to", recipient, smtp.messageId || "");
+      return smtp;
     }
-    if (process.env.SENDGRID_API_KEY?.trim()) {
-      await sendViaSendGrid(recipient, subject, html);
-      console.log("[safety] email sent via SendGrid to", recipient);
-      return { skipped: false, via: "sendgrid" };
-    }
-    return null;
+    console.warn("[safety] SMTP send skipped:", smtp.reason);
+    return { skipped: true, reason: smtp.reason || "smtp_not_configured" };
+  } catch (err) {
+    console.error("[safety] SMTP send failed:", err?.message || err);
+    throw err;
   }
-
-  if (smtpFirst) {
-    try {
-      const smtp = await sendViaConfiguredSmtp(recipient, subject, html);
-      if (!smtp.skipped) {
-        console.log("[safety] email sent via SMTP to", recipient, smtp.messageId || "");
-        return smtp;
-      }
-      console.warn("[safety] SMTP send skipped:", smtp.reason);
-    } catch (err) {
-      console.error("[safety] SMTP send failed, trying API mailer fallback:", err?.message || err);
-    }
-
-    const api = await tryApiProviders();
-    if (api) return api;
-
-    if (prefer === "smtp" || prefer === "gmail") {
-      return { skipped: true, reason: "smtp_failed_and_no_api_mailer" };
-    }
-  }
-
-  if (prefer === "resend" || prefer === "sendgrid") {
-    const api = await tryApiProviders();
-    if (api) return api;
-    return { skipped: true, reason: "api_mailer_not_configured" };
-  }
-
-  const api = await tryApiProviders();
-  if (api) return api;
-
-  const smtp = await sendViaConfiguredSmtp(recipient, subject, html);
-  if (!smtp.skipped) {
-    console.log("[safety] email sent via SMTP to", recipient, smtp.messageId || "");
-    return smtp;
-  }
-
-  console.warn(
-    "[safety] No mail transport: set SMTP_USER + SMTP_PASS, or RESEND_API_KEY / SENDGRID_API_KEY. Parent:",
-    recipient
-  );
-  return { skipped: true, reason: "no_mailer_config" };
 }
 
 // GET /api/safety/ping — verify DB + mail config (no auth; for deploy checks only)
@@ -347,11 +248,11 @@ router.get("/ping", async (req, res) => {
     const [childCountRows] = await db.query("SELECT COUNT(*) AS n FROM children");
     payload.children_in_db = Number(childCountRows[0]?.n ?? 0);
 
-    if (String(req.query.verify || "").toLowerCase() === "smtp") {
+    const verifySmtp = String(req.query.verify || "smtp").toLowerCase() !== "skip";
+    if (verifySmtp) {
       payload.smtp_verify = await verifySmtpConnection();
-      if (!payload.smtp_verify.ok && !mail.has_resend_api_key && !mail.has_sendgrid_api_key) {
-        payload.mail_hint =
-          "Gmail SMTP could not be reached from this host (common on Render). Add RESEND_API_KEY or SENDGRID_API_KEY on kidora-api, redeploy, then call /api/safety/test-flagged-email.";
+      if (!payload.smtp_verify.ok) {
+        payload.hint = buildSmtpFailureHint(payload.smtp_verify.error, mail);
       }
     }
 
