@@ -1,9 +1,7 @@
 const express = require("express");
 const router = express.Router();
 const db = require("../db");
-const firebaseAdmin = require("../firebaseAdmin");
-const { sendParentNotificationPush } = require("../fcmReminders");
-const { resolveSmtpUser, sendConfiguredSmtpMail, getSmtpPingDiagnostics } = require("../smtpEnv");
+const { resolveSmtpUser, getTransporter, getSmtpPingDiagnostics } = require("../smtpEnv");
 
 /** Default substring checks (lowercase). Extend via env BAD_SEARCH_PHRASES=comma,separated */
 const DEFAULT_BLOCKED_PHRASES = [
@@ -57,22 +55,6 @@ function queryMatchesBlocklist(normalized) {
   if (!normalized || normalized.length < 2) return false;
   const phrases = loadBlockedPhrases();
   return phrases.some((p) => p.length >= 2 && normalized.includes(p));
-}
-
-/**
- * Accept if the full query matches the server blocklist, or the child device
- * sends matched_keyword (phrase from its list) that the server also lists and
- * that appears inside the normalized query (prevents arbitrary keyword injection).
- */
-function serverAcceptsFlaggedSearch(normalized, body) {
-  if (queryMatchesBlocklist(normalized)) return true;
-  const mkRaw =
-    body && typeof body.matched_keyword === "string" ? body.matched_keyword : "";
-  const mk = normalizeQuery(mkRaw);
-  if (!mk || mk.length < 2) return false;
-  if (!normalized.includes(mk)) return false;
-  const phrases = loadBlockedPhrases();
-  return phrases.some((p) => p.length >= 2 && normalizeQuery(p) === mk);
 }
 
 function escapeHtml(s) {
@@ -175,334 +157,83 @@ function buildFlaggedSearchEmailHtml({
 </body></html>`;
 }
 
-/** Plain-text body for clients that hide HTML or for inbox previews. */
-function buildFlaggedSearchEmailPlain({
-  childName,
-  query,
-  sourcePackage,
-  deviceLocalDate,
-  deviceLocalTime,
-  deviceTimezone,
-  serverReceivedUtc,
-}) {
-  const child = childName || "Your child";
-  const q = String(query || "").slice(0, 500);
-  const pkg = sourcePackage || "unknown app/browser";
-  return [
-    "KIDORA — URGENT: flagged search",
-    "",
-    `Child: ${child}`,
-    `What they searched: ${q}`,
-    `App / browser (package): ${pkg}`,
-    `Device date: ${deviceLocalDate || "—"}`,
-    `Device time: ${deviceLocalTime || "—"}`,
-    `Time zone: ${deviceTimezone || "—"}`,
-    `Server received (UTC): ${serverReceivedUtc || new Date().toISOString()}`,
-    "",
-    "Open the Kidora parent app on your phone for more context.",
-  ].join("\n");
-}
-
 /**
- * Safety parent email transports (see SAFETY_MAIL_ORDER):
- * - Resend / SendGrid HTTP APIs first (reliable from Render, Railway, etc.)
- * - Then Nodemailer SMTP — Gmail smtp.gmail.com often "succeeds" but never reaches inbox from cloud IPs
- * - Finally SAFETY_EMAIL_WEBHOOK_URL
+ * Resend — optional alternative to Gmail SMTP (https://resend.com).
+ * Only used if RESEND_API_KEY is set and EMAIL_PROVIDER != gmail/smtp.
  */
-const MAIL_TRANSPORT_TIMEOUT_MS = Math.min(
-  120000,
-  Math.max(
-    10000,
-    parseInt(process.env.SAFETY_MAIL_TRANSPORT_TIMEOUT_MS || "35000", 10) || 35000
-  )
-);
+async function sendViaResend(to, subject, html) {
+  const key = process.env.RESEND_API_KEY?.trim();
+  const from =
+    process.env.RESEND_FROM?.trim() ||
+    "Kidora <onboarding@resend.dev>";
+  if (!key) throw new Error("RESEND_API_KEY missing");
 
-/** Avoid one slow/hung SMTP connection blocking webhook fallback timing. */
-function promiseWithMailTimeout(label, promise) {
-  let timer;
-  const timeoutPromise = new Promise((_, reject) => {
-    timer = setTimeout(
-      () => reject(new Error(`${label}: timed out after ${MAIL_TRANSPORT_TIMEOUT_MS}ms`)),
-      MAIL_TRANSPORT_TIMEOUT_MS
-    );
+  const res = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${key}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      from,
+      to: [to],
+      subject,
+      html,
+      headers: {
+        "X-Priority": "1",
+        Importance: "high",
+      },
+    }),
   });
-  return Promise.race([
-    promise.finally(() => clearTimeout(timer)),
-    timeoutPromise,
-  ]);
+
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Resend HTTP ${res.status}: ${body.slice(0, 500)}`);
+  }
 }
 
 /**
- * Optional Zapier/Make/n8n relay: POST JSON payload when SMTP fails or is skipped.
+ * SendGrid Web API. Free tier ~100 emails/day for new accounts.
  */
-async function attemptSafetyEmailWebhook(recipientNorm, subject, html, textPlain) {
-  const url = String(process.env.SAFETY_EMAIL_WEBHOOK_URL || "").trim();
-  if (!url) {
-    return { skipped: true, reason: "no_webhook_url" };
+async function sendViaSendGrid(to, subject, html) {
+  const key = process.env.SENDGRID_API_KEY;
+  const fromEmail =
+    process.env.SENDGRID_FROM_EMAIL?.trim() ||
+    process.env.SMTP_FROM?.trim() ||
+    resolveSmtpUser();
+  if (!key) throw new Error("SENDGRID_API_KEY missing");
+  if (!fromEmail) {
+    throw new Error("Set SENDGRID_FROM_EMAIL (verified sender) or SMTP_FROM");
   }
 
-  try {
-    await promiseWithMailTimeout(
-      "safety_webhook",
-      (async () => {
-        const headers = { "Content-Type": "application/json" };
-        const sec = String(process.env.SAFETY_EMAIL_WEBHOOK_SECRET || "").trim();
-        if (sec) headers.Authorization = `Bearer ${sec}`;
-        const ac =
-          typeof AbortSignal !== "undefined" && AbortSignal.timeout
-            ? AbortSignal.timeout(MAIL_TRANSPORT_TIMEOUT_MS)
-            : undefined;
-        const res = await fetch(url, {
-          method: "POST",
-          headers,
-          body: JSON.stringify({
-            kind: "kidora_safety_parent_email",
-            to: recipientNorm,
-            subject,
-            html,
-            text: textPlain ? String(textPlain) : "",
-          }),
-          signal: ac,
-        });
-        if (!res.ok) {
-          const body = await res.text();
-          throw new Error(`Webhook HTTP ${res.status}: ${body.slice(0, 400)}`);
-        }
-      })()
-    );
-  } catch (e) {
-    const msg = e?.message || String(e);
-    console.warn("[safety] SAFETY_EMAIL_WEBHOOK_URL failed:", msg.slice(0, 300));
-    return { skipped: true, reason: `webhook:${msg.slice(0, 200)}` };
-  }
-
-  console.log("[safety] SAFETY_EMAIL_WEBHOOK_URL accepted POST (relay may send inbox mail separately)");
-  return { skipped: false, via: "webhook" };
-}
-
-/**
- * Optional [Resend](https://resend.com) HTTP API — works when SMTP from cloud to Gmail is flaky.
- * Set RESEND_API_KEY + RESEND_FROM (verified sender, e.g. alerts@yourdomain.com).
- */
-async function attemptResendEmail(recipientNorm, subject, html, textPlain) {
-  const key = String(process.env.RESEND_API_KEY || "").trim();
-  const from = String(process.env.RESEND_FROM || "").trim();
-  if (!key || !from) {
-    return { skipped: true, reason: "no_resend_config" };
-  }
-
-  try {
-    await promiseWithMailTimeout(
-      "resend_api",
-      (async () => {
-        const ac =
-          typeof AbortSignal !== "undefined" && AbortSignal.timeout
-            ? AbortSignal.timeout(MAIL_TRANSPORT_TIMEOUT_MS)
-            : undefined;
-        const payload = {
-          from,
-          to: [recipientNorm],
+  const res = await fetch("https://api.sendgrid.com/v3/mail/send", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${key}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      personalizations: [
+        {
+          to: [{ email: to }],
           subject,
-          html,
-        };
-        const tp = textPlain && String(textPlain).trim();
-        if (tp) payload.text = tp;
-
-        const res = await fetch("https://api.resend.com/emails", {
-          method: "POST",
           headers: {
-            Authorization: `Bearer ${key}`,
-            "Content-Type": "application/json",
+            "X-Priority": "1",
+            Importance: "high",
+            Priority: "urgent",
           },
-          body: JSON.stringify(payload),
-          signal: ac,
-        });
-        if (!res.ok) {
-          const body = await res.text();
-          throw new Error(`Resend HTTP ${res.status}: ${body.slice(0, 400)}`);
-        }
-      })()
-    );
-  } catch (e) {
-    const msg = e?.message || String(e);
-    console.warn("[safety] Resend failed:", msg.slice(0, 300));
-    return { skipped: true, reason: `resend:${msg.slice(0, 200)}` };
-  }
+        },
+      ],
+      from: { email: fromEmail, name: "Kidora" },
+      content: [{ type: "text/html", value: html }],
+      categories: ["kidora", "safety_alert"],
+    }),
+  });
 
-  console.log("[safety] Resend API accepted email (check Resend dashboard / inbox delivery)");
-  return { skipped: false, via: "resend" };
-}
-
-function parseFromForApi(raw) {
-  const s = String(raw || "").trim();
-  if (!s) return { name: "Kidora", email: "" };
-  const m = s.match(/^(.+?)\s*<([^>]+@[^>]+)>\s*$/);
-  if (m) {
-    const name = m[1].replace(/^["']|["']$/g, "").trim() || "Kidora";
-    return { name, email: m[2].trim() };
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`SendGrid HTTP ${res.status}: ${body.slice(0, 500)}`);
   }
-  if (s.includes("@")) return { name: "Kidora", email: s };
-  return { name: "Kidora", email: "" };
-}
-
-/**
- * Optional SendGrid v3 API — reliable from cloud; free tier available.
- * SENDGRID_API_KEY (Bearer) + SENDGRID_FROM (verified sender email), or falls back to SMTP_FROM / SMTP_USER.
- */
-async function attemptSendGridEmail(recipientNorm, subject, html, textPlain) {
-  const key = String(process.env.SENDGRID_API_KEY || "").trim();
-  let fromRaw =
-    String(process.env.SENDGRID_FROM || "").trim() ||
-    String(process.env.SMTP_FROM || "").trim() ||
-    String(process.env.SMTP_USER || "").trim();
-  const { name: fromName, email: fromEmail } = parseFromForApi(fromRaw);
-  if (!key || !fromEmail.includes("@")) {
-    return { skipped: true, reason: "no_sendgrid_config" };
-  }
-
-  const content = [];
-  const tp = textPlain && String(textPlain).trim();
-  if (tp) {
-    content.push({ type: "text/plain", value: tp });
-  }
-  content.push({ type: "text/html", value: String(html || "") });
-
-  try {
-    await promiseWithMailTimeout(
-      "sendgrid_api",
-      (async () => {
-        const ac =
-          typeof AbortSignal !== "undefined" && AbortSignal.timeout
-            ? AbortSignal.timeout(MAIL_TRANSPORT_TIMEOUT_MS)
-            : undefined;
-        const res = await fetch("https://api.sendgrid.com/v3/mail/send", {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${key}`,
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            personalizations: [{ to: [{ email: recipientNorm }] }],
-            from: { email: fromEmail, name: fromName },
-            subject,
-            content,
-          }),
-          signal: ac,
-        });
-        if (!res.ok) {
-          const body = await res.text();
-          throw new Error(`SendGrid HTTP ${res.status}: ${body.slice(0, 400)}`);
-        }
-      })()
-    );
-  } catch (e) {
-    const msg = e?.message || String(e);
-    console.warn("[safety] SendGrid failed:", msg.slice(0, 300));
-    return { skipped: true, reason: `sendgrid:${msg.slice(0, 200)}` };
-  }
-
-  console.log("[safety] SendGrid API accepted email");
-  return { skipped: false, via: "sendgrid" };
-}
-
-function isResendConfigured() {
-  return !!(
-    String(process.env.RESEND_API_KEY || "").trim() &&
-    String(process.env.RESEND_FROM || "").trim()
-  );
-}
-
-function isSendGridConfigured() {
-  const key = String(process.env.SENDGRID_API_KEY || "").trim();
-  if (!key) return false;
-  const fromRaw =
-    String(process.env.SENDGRID_FROM || "").trim() ||
-    String(process.env.SMTP_FROM || "").trim() ||
-    String(process.env.SMTP_USER || "").trim();
-  return parseFromForApi(fromRaw).email.includes("@");
-}
-
-/**
- * Default: resend → sendgrid → smtp (HTTP APIs before Gmail SMTP from cloud).
- * Override: SAFETY_MAIL_ORDER="smtp,resend" (comma list: resend, sendgrid, smtp)
- */
-function buildOrderedSafetyTransportFns(recipient, subject, html, textPlain) {
-  async function attemptSmtp() {
-    const smtp = await sendViaConfiguredSmtp(recipient, subject, html, textPlain);
-    if (!smtp.skipped) {
-      return { skipped: false, via: smtp.via || "smtp", messageId: smtp.messageId };
-    }
-    return { skipped: true, reason: smtp.reason || "smtp_not_configured" };
-  }
-  async function attemptResend() {
-    return attemptResendEmail(recipient, subject, html, textPlain);
-  }
-  async function attemptSendGrid() {
-    return attemptSendGridEmail(recipient, subject, html, textPlain);
-  }
-
-  const registry = {
-    resend: attemptResend,
-    sendgrid: attemptSendGrid,
-    smtp: attemptSmtp,
-  };
-
-  const rawOrder = String(process.env.SAFETY_MAIL_ORDER || "").trim().toLowerCase();
-  let keys;
-  if (rawOrder) {
-    keys = rawOrder
-      .split(/[\s,]+/)
-      .map((k) => k.trim())
-      .filter((k) => registry[k]);
-    if (!keys.length) keys = ["resend", "sendgrid", "smtp"];
-  } else {
-    keys = ["resend", "sendgrid", "smtp"];
-  }
-
-  return keys.map((k) => registry[k]);
-}
-
-/** Readable hint for admins / Logcat debugging when email_sent is false. */
-function deliveryHintWhenEmailSkipped(parentEmailNorm, emailSent, emailErrorRaw) {
-  if (emailSent) return null;
-  if (!parentEmailNorm) {
-    return "Open Kidora parent app while signed in to sync Firebase email into MySQL, or ensure firebase_uid matches the Firebase project.";
-  }
-  let diag = null;
-  try {
-    diag = getSmtpPingDiagnostics();
-  } catch (_e) {
-    // ignore
-  }
-  if (diag?.smtp_identity_warning) {
-    return diag.smtp_identity_warning;
-  }
-  const err = String(emailErrorRaw || "").toLowerCase();
-  if (
-    err.includes("username and password") ||
-    err.includes("invalid login") ||
-    err.includes("eauth") ||
-    err.includes("blocked") ||
-    err.includes("timed out") ||
-    err.includes("econn refused") ||
-    err.includes("connection closed") ||
-    err.includes("smtp")
-  ) {
-    return "SMTP reported an error above; verify SMTP_* on your **API** host (not the DB) and check logs for [smtpEnv] / [safety].";
-  }
-  if (err.includes("resend:") || err.includes("resend http")) {
-    return "RESEND_API_KEY / RESEND_FROM failed — verify the API key and that the From domain is verified in Resend.";
-  }
-  if (err.includes("sendgrid:") || err.includes("sendgrid http")) {
-    return "SENDGRID_API_KEY failed — verify key and Single Sender / domain auth; set SENDGRID_FROM (or SMTP_FROM) to a verified address.";
-  }
-  if (err.includes("webhook:http") || err.includes("webhook:")) {
-    return "SAFETY_EMAIL_WEBHOOK_URL relay failed — fix the Zapier/Make/n8n destination or SMTP so the webhook is not needed.";
-  }
-  if ((diag?.on_render || diag?.on_railway) && diag?.gmail_mode && diag?.smtp_ready) {
-    return "Cloud host + Gmail SMTP often drops outbound mail silently; SMTP_* login can still succeed. Add RESEND_API_KEY + RESEND_FROM or SENDGRID_API_KEY (both run before SMTP), or use domain transactional SMTP.";
-  }
-  return "See host logs under [safety]/[smtpEnv] and email_error in this JSON. For Render/cloud + Gmail SMTP: add RESEND_API_KEY+RESEND_FROM or SENDGRID_API_KEY (they run before SMTP and actually reach the inbox).";
 }
 
 /** Single recipient: parent of the child only. */
@@ -513,60 +244,19 @@ function normalizeParentEmail(raw) {
   return s;
 }
 
-/**
- * MySQL `users.email` is often empty for Google-sign-in parents who never hit POST /users.
- * Firebase Auth is the source of truth; we persist back to MySQL for the next alert.
- *
- * @param {{ parent_id: number, parent_email?: string|null, parent_firebase_uid?: string|null }} row
- */
-async function resolveParentRecipientEmail(row) {
-  const parentId = row.parent_id;
-  const fromDb = normalizeParentEmail(row.parent_email);
-  if (fromDb) {
-    return { email: fromDb, source: "mysql" };
-  }
-
-  const uid = row.parent_firebase_uid ? String(row.parent_firebase_uid).trim() : "";
-  if (!uid) {
-    return {
-      email: null,
-      source: "none",
-      detail: "users.email_empty_and_no_firebase_uid",
-    };
-  }
-
-  try {
-    const rec = await firebaseAdmin.auth().getUser(uid);
-    const fromFb = normalizeParentEmail(rec.email);
-    if (!fromFb) {
-      return { email: null, source: "none", detail: "firebase_user_has_no_email" };
-    }
-    try {
-      await db.query("UPDATE users SET email = ? WHERE id = ?", [fromFb, parentId]);
-    } catch (persistErr) {
-      console.warn("[safety] could not persist Firebase email to users:", persistErr?.message);
-    }
-    return { email: fromFb, source: "firebase" };
-  } catch (e) {
-    const code = e?.code || e?.errorInfo?.code;
-    console.warn("[safety] Firebase auth().getUser failed:", code || e?.message);
-    return {
-      email: null,
-      source: "none",
-      detail: String(code || e?.message || "firebase_getUser_failed").slice(0, 160),
-    };
-  }
-}
-
-/** Gmail / SMTP: From address is SMTP_FROM (or SMTP_USER). Parents see "Kidora <mailbox@...>" when using defaults. */
-async function sendViaConfiguredSmtp(to, subject, html, textPlain) {
+/** Gmail / SMTP: From address is SMTP_FROM (or SMTP_USER). Parents see "Kidora <kidoraapp06@gmail.com>" when using defaults. */
+async function sendViaConfiguredSmtp(to, subject, html) {
+  const tx = getTransporter();
   const fromRaw = process.env.SMTP_FROM?.trim() || resolveSmtpUser() || "";
+  if (!tx) {
+    return { skipped: true, reason: "no_smtp_transport" };
+  }
   if (!fromRaw) {
     return { skipped: true, reason: "no_smtp_from_set_SMTP_FROM_or_SMTP_USER" };
   }
 
   const fromHeader = fromRaw.includes("<") ? fromRaw : `"Kidora" <${fromRaw}>`;
-  const mail = {
+  const info = await tx.sendMail({
     from: fromHeader,
     to,
     subject,
@@ -577,85 +267,53 @@ async function sendViaConfiguredSmtp(to, subject, html, textPlain) {
       Priority: "urgent",
       "X-MSMail-Priority": "High",
     },
-  };
-  if (textPlain && String(textPlain).trim()) {
-    mail.text = String(textPlain);
-  }
-  try {
-    const info = await promiseWithMailTimeout(
-      "smtp_send",
-      sendConfiguredSmtpMail(mail)
-    );
-    return { skipped: false, via: "smtp", messageId: info.messageId };
-  } catch (e) {
-    const msg = String(e?.message || e).slice(0, 400);
-    console.warn("[safety] SMTP send failed:", msg);
-    return { skipped: true, reason: msg };
-  }
+  });
+  return { skipped: false, via: "smtp", messageId: info.messageId };
 }
 
-/**
- * Flagged-search parent mail: Resend → SendGrid → SMTP (see buildOrderedSafetyTransportFns), then webhook.
- */
-async function sendParentEmail(to, subject, html, textPlain) {
+async function sendParentEmail(to, subject, html) {
   const recipient = normalizeParentEmail(to);
   if (!recipient) {
     console.warn("[safety] invalid parent email, skip send");
     return { skipped: true, reason: "invalid_email" };
   }
 
-  const transportFns = buildOrderedSafetyTransportFns(
-    recipient,
-    subject,
-    html,
-    textPlain
-  );
+  const prefer = (process.env.EMAIL_PROVIDER || "auto").toLowerCase().trim();
+  const smtpFirst = prefer === "smtp" || prefer === "gmail";
 
-  async function tryChain(fns) {
-    const errors = [];
-    for (const fn of fns) {
-      try {
-        const r = await fn();
-        if (r && !r.skipped) {
-          console.log(
-            `[safety] email sent (${r.via}) to`,
-            recipient,
-            r.messageId || ""
-          );
-          return r;
-        }
-        if (r?.reason) errors.push(r.reason);
-      } catch (e) {
-        const msg = e?.message || String(e);
-        console.warn("[safety] mail transport error:", msg.slice(0, 300));
-        errors.push(msg.slice(0, 160));
-      }
+  if (smtpFirst) {
+    const smtp = await sendViaConfiguredSmtp(recipient, subject, html);
+    if (!smtp.skipped) {
+      console.log("[safety] email sent via SMTP to", recipient, smtp.messageId || "");
+      return smtp;
     }
-    console.warn(
-      "[safety] all mail transports failed or skipped for",
-      recipient,
-      errors.join(" | ").slice(0, 400)
-    );
-    return {
-      skipped: true,
-      reason: errors.length ? errors.join(" | ").slice(0, 500) : "no_mailer_config",
-    };
+    console.warn("[safety] EMAIL_PROVIDER=gmail/smtp but SMTP send skipped:", smtp.reason);
+    return { skipped: true, reason: smtp.reason || "smtp_not_configured" };
   }
 
-  async function runMailChain(fns) {
-    const inner = await tryChain(fns);
-    if (!inner.skipped) return inner;
-    const hook = await attemptSafetyEmailWebhook(recipient, subject, html, textPlain);
-    if (!hook.skipped) return hook;
-    if (hook.reason === "no_webhook_url") return inner;
-    return {
-      skipped: true,
-      reason:
-        `${inner.reason || "no_mailer_config"} | ${hook.reason}`.slice(0, 500),
-    };
+  if (process.env.RESEND_API_KEY) {
+    await sendViaResend(recipient, subject, html);
+    console.log("[safety] email sent via Resend to", recipient);
+    return { skipped: false, via: "resend" };
   }
 
-  return runMailChain(transportFns);
+  if (process.env.SENDGRID_API_KEY) {
+    await sendViaSendGrid(recipient, subject, html);
+    console.log("[safety] email sent via SendGrid to", recipient);
+    return { skipped: false, via: "sendgrid" };
+  }
+
+  const smtp = await sendViaConfiguredSmtp(recipient, subject, html);
+  if (!smtp.skipped) {
+    console.log("[safety] email sent via SMTP to", recipient, smtp.messageId || "");
+    return smtp;
+  }
+
+  console.warn(
+    "[safety] No mail transport: set EMAIL_PROVIDER=gmail + SMTP_* for kidoraapp06@gmail.com (or RESEND_API_KEY / SENDGRID_API_KEY). Parent:",
+    recipient
+  );
+  return { skipped: true, reason: "no_mailer_config" };
 }
 
 // GET /api/safety/ping — verify DB + mail config (no auth; for deploy checks only)
@@ -663,47 +321,10 @@ router.get("/ping", async (_req, res) => {
   try {
     await db.query("SELECT 1 AS ok");
     const mail = getSmtpPingDiagnostics();
-    let safety_stats = null;
-    try {
-      const [sx] = await db.query(
-        "SELECT MAX(id) AS last_id, COUNT(*) AS total FROM safety_search_alerts"
-      );
-      safety_stats = {
-        safety_search_alerts_last_id: sx[0]?.last_id ?? null,
-        safety_search_alerts_total: Number(sx[0]?.total ?? 0),
-      };
-    } catch (e) {
-      safety_stats = { error: String(e?.message || e).slice(0, 200) };
-    }
-    const resendOk = isResendConfigured();
-    const sendgridOk = isSendGridConfigured();
-    const safety_http_configured = resendOk || sendgridOk;
-    const cloudGmailOnly =
-      (mail.on_render || mail.on_railway) &&
-      mail.gmail_mode &&
-      mail.smtp_ready &&
-      !safety_http_configured;
-
     return res.json({
       ok: true,
       db: true,
-      ...safety_stats,
       ...mail,
-      safety_email_webhook_set: !!String(process.env.SAFETY_EMAIL_WEBHOOK_URL || "").trim(),
-      resend_configured: resendOk,
-      sendgrid_configured: sendgridOk,
-      safety_http_configured: safety_http_configured,
-      safety_mail_order_effective:
-        String(process.env.SAFETY_MAIL_ORDER || "").trim() || "resend,sendgrid,smtp",
-      email_provider: String(process.env.EMAIL_PROVIDER || "auto").trim() || "auto",
-      safety_mail_transport: "resend_sendgrid_smtp_webhook",
-      safety_mail_order: "resend_then_sendgrid_then_smtp_then_webhook_if_needed",
-      mail_timeout_ms_default: MAIL_TRANSPORT_TIMEOUT_MS,
-      auto_mail_order_hint:
-        "Safety emails try Resend, then SendGrid (HTTP), then SMTP, then webhook. On Render with Gmail SMTP, inbox delivery often fails unless you add RESEND_* or SENDGRID_API_KEY.",
-      safety_inbox_action_required: cloudGmailOnly
-        ? "Add RESEND_API_KEY+RESEND_FROM and/or SENDGRID_API_KEY (+ verified SENDGRID_FROM or use SMTP_FROM). Gmail SMTP from cloud usually does not reach the parent inbox even when smtp_ready is true."
-        : null,
     });
   } catch (err) {
     console.error("[safety] ping", err);
@@ -746,7 +367,7 @@ router.post("/report-flagged-search", async (req, res) => {
       return res.status(400).json({ ok: false, error: "query required" });
     }
 
-    if (!serverAcceptsFlaggedSearch(normalized, req.body)) {
+    if (!queryMatchesBlocklist(normalized)) {
       console.warn("[safety] reject: not in blocklist", {
         childId,
         preview: `${normalized.slice(0, 60)}${normalized.length > 60 ? "…" : ""}`,
@@ -755,7 +376,7 @@ router.post("/report-flagged-search", async (req, res) => {
     }
 
     const [rows] = await db.query(
-      `SELECT c.id, c.name, c.parent_id, u.email AS parent_email, u.firebase_uid AS parent_firebase_uid
+      `SELECT c.id, c.name, c.parent_id, u.email AS parent_email
        FROM children c
        JOIN users u ON u.id = c.parent_id
        WHERE c.id = ?`,
@@ -775,31 +396,10 @@ router.post("/report-flagged-search", async (req, res) => {
       });
     }
 
-    const childName = rows[0].name;
-    const displayName =
-      typeof req.body.child_display_name === "string" && req.body.child_display_name.trim()
-        ? String(req.body.child_display_name).trim().slice(0, 160)
-        : null;
-    const labelForParent = (displayName && displayName.trim()) || childName || "Your child";
-
-    const [dupRecent] = await db.query(
-      `SELECT query_text FROM safety_search_alerts
-       WHERE child_id = ? AND created_at > DATE_SUB(NOW(), INTERVAL 3 MINUTE)
-       ORDER BY id DESC LIMIT 80`,
-      [childId]
-    );
-    const isDup =
-      Array.isArray(dupRecent) &&
-      dupRecent.some((row) => normalizeQuery(row.query_text) === normalized);
-    if (isDup) {
-      return res.json({
-        ok: true,
-        logged: false,
-        deduped: true,
-        message:
-          "Same normalized search was already stored within the last few minutes — no duplicate row/email.",
-        hint: "Wait 3+ minutes or test with different wording so the alert pipeline runs again.",
-      });
+    const { name: childName, parent_email: parentEmail } = rows[0];
+    const parentEmailNorm = normalizeParentEmail(parentEmail);
+    if (!parentEmailNorm) {
+      return res.status(400).json({ ok: false, error: "parent email missing or invalid" });
     }
 
     const [recent] = await db.query(
@@ -807,27 +407,8 @@ router.post("/report-flagged-search", async (req, res) => {
       [childId]
     );
     const n = recent[0]?.n ?? 0;
-    const hourlyCap = Math.max(12, parseInt(process.env.SAFETY_ALERTS_PER_CHILD_HOUR || "60", 10) || 60);
-    if (n >= hourlyCap) {
-      console.warn("[safety] rate_limited", { childId, n, hourlyCap });
-      return res.status(429).json({ ok: false, error: "rate_limited", hourly_cap: hourlyCap });
-    }
-
-    const [insertResult] = await db.query(
-      `INSERT INTO safety_search_alerts (child_id, query_text, source_package) VALUES (?, ?, ?)`,
-      [childId, query.slice(0, 2000), sourcePackage.slice(0, 255)]
-    );
-    const alertId = insertResult?.insertId ?? null;
-    console.log("[safety] INSERT safety_search_alerts ok (before email)", { childId, alertId });
-
-    const resolvedRecipient = await resolveParentRecipientEmail(rows[0]);
-    const parentEmailNorm = resolvedRecipient.email;
-    if (!parentEmailNorm) {
-      console.warn("[safety] parent email missing — row saved; push still attempted", {
-        childId,
-        alertId,
-        detail: resolvedRecipient.detail,
-      });
+    if (n >= 12) {
+      return res.status(429).json({ ok: false, error: "rate_limited" });
     }
 
     const deviceLocalDate =
@@ -844,46 +425,37 @@ router.post("/report-flagged-search", async (req, res) => {
         : "";
     const serverReceivedUtc = new Date().toISOString();
 
+    const html = buildFlaggedSearchEmailHtml({
+      childName,
+      query: query.slice(0, 500),
+      sourcePackage,
+      deviceLocalDate,
+      deviceLocalTime,
+      deviceTimezone,
+      serverReceivedUtc,
+    });
+
     const kw = query.length > 42 ? `${query.slice(0, 42)}…` : query;
-    const subject = `[URGENT] Kidora: "${kw}" — ${labelForParent}`;
+    const subject = `[URGENT] Kidora: "${kw}" — ${childName || "Child"}`;
+
+    // Always persist first (same MySQL as process.env.DATABASE_URL on THIS host).
+    await db.query(
+      `INSERT INTO safety_search_alerts (child_id, query_text, source_package) VALUES (?, ?, ?)`,
+      [childId, query.slice(0, 2000), sourcePackage.slice(0, 255)]
+    );
+    console.log("[safety] INSERT safety_search_alerts ok", { childId });
 
     let emailSent = false;
     let emailError = null;
-    let emailVia = null;
-    if (parentEmailNorm) {
-      const html = buildFlaggedSearchEmailHtml({
-        childName: labelForParent,
-        query: query.slice(0, 500),
-        sourcePackage,
-        deviceLocalDate,
-        deviceLocalTime,
-        deviceTimezone,
-        serverReceivedUtc,
-      });
-
-      const plain = buildFlaggedSearchEmailPlain({
-        childName: labelForParent,
-        query: query.slice(0, 500),
-        sourcePackage,
-        deviceLocalDate,
-        deviceLocalTime,
-        deviceTimezone,
-        serverReceivedUtc,
-      });
-
-      try {
-        const mailResult = await sendParentEmail(parentEmailNorm, subject, html, plain);
-        emailSent = !mailResult.skipped;
-        if (!mailResult.skipped) emailVia = mailResult.via || null;
-        if (mailResult.skipped) {
-          emailError = mailResult.reason || "skipped";
-        }
-      } catch (mailErr) {
-        console.error("[safety] send mail error", mailErr?.message || mailErr);
-        emailError = String(mailErr?.message || "email_failed").slice(0, 200);
+    try {
+      const mailResult = await sendParentEmail(parentEmailNorm, subject, html);
+      emailSent = !mailResult.skipped;
+      if (mailResult.skipped) {
+        emailError = mailResult.reason || "skipped";
       }
-    } else {
-      emailError = resolvedRecipient.detail || "no_parent_email";
+    } catch (mailErr) {
+      console.error("[safety] send mail error (row already saved)", mailErr?.message || mailErr);
+      emailError = String(mailErr?.message || "email_failed").slice(0, 200);
     }
 
     try {
@@ -900,78 +472,16 @@ router.post("/report-flagged-search", async (req, res) => {
       console.warn("[safety] notification insert", notifErr.message);
     }
 
-    const queryPush =
-      query.length > 120 ? `${query.slice(0, 120)}…` : query;
-    const pushBody = `${labelForParent} searched: "${queryPush}" — open Kidora.`.slice(
-      0,
-      2000
-    );
-
-    let pushResult = { sent: false, skipped: "not_attempted" };
-    try {
-      pushResult = await sendParentNotificationPush(db, rows[0].parent_id, {
-        title: "Kidora — safety alert",
-        body: pushBody,
-        type: "safety_search",
-        childId,
-        query: query.slice(0, 300),
-      });
-    } catch (pushErr) {
-      console.warn("[safety] parent FCM", pushErr?.message || pushErr);
-      pushResult = { sent: false, error: String(pushErr?.message || pushErr).slice(0, 400) };
-    }
-
-    let mailDiag = null;
-    try {
-      mailDiag = getSmtpPingDiagnostics();
-    } catch (_e) {
-      mailDiag = {};
-    }
-
-    if (!emailSent) {
-      console.warn("[safety] email NOT delivered", {
-        alert_id: alertId,
-        child_id: childId,
-        email_error: emailError,
-        parent_email_source: resolvedRecipient.source,
-        smtp_ready: !!mailDiag.smtp_ready,
-        resend_configured: isResendConfigured(),
-        sendgrid_configured: isSendGridConfigured(),
-        webhook_set: !!String(process.env.SAFETY_EMAIL_WEBHOOK_URL || "").trim(),
-      });
-    }
-
     return res.json({
       ok: true,
       logged: true,
-      alert_id: alertId,
       email_sent: emailSent,
-      email_via: emailVia,
       email_error: emailError,
-      email_skipped: !parentEmailNorm,
-      parent_email_source: resolvedRecipient.source,
-      parent_email_masked: parentEmailNorm
-        ? (() => {
-            const [loc, dom] = parentEmailNorm.split("@");
-            if (!dom) return "***";
-            return `${(loc || "?").slice(0, 1)}***@${dom}`;
-          })()
-        : null,
-      mail_env: {
-        smtp_ready: !!mailDiag.smtp_ready,
-        safety_mail_transport: "resend_sendgrid_smtp_webhook",
-        safety_mail_order: "resend_then_sendgrid_then_smtp_then_webhook_if_needed",
-        safety_mail_order_override: String(process.env.SAFETY_MAIL_ORDER || "").trim() || null,
-        safety_email_webhook_set: !!String(process.env.SAFETY_EMAIL_WEBHOOK_URL || "").trim(),
-        resend_configured: isResendConfigured(),
-        sendgrid_configured: isSendGridConfigured(),
-        email_provider: String(process.env.EMAIL_PROVIDER || "auto").trim() || "auto",
-        delivery_hint:
-          deliveryHintWhenEmailSkipped(parentEmailNorm, emailSent, emailError) || undefined,
-      },
-      push_sent: !!pushResult.sent,
-      push_skipped: pushResult.skipped || null,
-      push_error: pushResult.error || null,
+      parent_email_masked: (() => {
+        const [loc, dom] = parentEmailNorm.split("@");
+        if (!dom) return "***";
+        return `${(loc || "?").slice(0, 1)}***@${dom}`;
+      })(),
     });
   } catch (err) {
     console.error("[safety] report-flagged-search", err);
