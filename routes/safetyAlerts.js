@@ -351,7 +351,7 @@ function deliveryHintWhenEmailSkipped(parentEmailNorm, emailSent, emailErrorRaw)
     err.includes("timed out") ||
     err.includes("econn refused")
   ) {
-    return "Gmail SMTP from a cloud server often fails. Use EMAIL_PROVIDER=auto with RESEND_API_KEY plus verified RESEND_FROM (or SENDGRID_*). Set SAFETY_MAIL_APIS_FIRST=1 if SMTP must not run first.";
+    return "Gmail SMTP from Render/cloud often fails first. Add RESEND_API_KEY + verified RESEND_FROM; with recent server code, APIs run before Gmail even if EMAIL_PROVIDER=gmail. Or use EMAIL_PROVIDER=auto.";
   }
   if (
     String(process.env.RESEND_API_KEY || "").trim() === "" &&
@@ -446,6 +446,26 @@ async function sendViaConfiguredSmtp(to, subject, html, textPlain) {
   return { skipped: false, via: "smtp", messageId: info.messageId };
 }
 
+/**
+ * When Resend/SendGrid keys exist and SAFETY_MAIL_SMTP_FIRST is not set, transactional APIs run first.
+ * Mirrors legacy auto branch; reused for EMAIL_PROVIDER=gmail so PaaS is not blocked on Gmail SMTP.
+ */
+function orderSafetyMailChainHints() {
+  const hasResend = !!String(process.env.RESEND_API_KEY || "").trim();
+  const hasSg = !!String(process.env.SENDGRID_API_KEY || "").trim();
+  const apisReady = hasResend || hasSg;
+  let smtpReady = false;
+  try {
+    smtpReady = !!getSmtpPingDiagnostics().smtp_ready;
+  } catch (_e) {
+    // ignore
+  }
+  const smtpFirst =
+    process.env.SAFETY_MAIL_SMTP_FIRST === "1" ||
+    (smtpReady && !apisReady && process.env.SAFETY_MAIL_APIS_FIRST !== "1");
+  return { smtpFirst, apisReady };
+}
+
 async function sendParentEmail(to, subject, html, textPlain) {
   const recipient = normalizeParentEmail(to);
   if (!recipient) {
@@ -453,7 +473,12 @@ async function sendParentEmail(to, subject, html, textPlain) {
     return { skipped: true, reason: "invalid_email" };
   }
 
-  const prefer = (process.env.EMAIL_PROVIDER || "auto").toLowerCase().trim();
+  const preferRaw = String(process.env.EMAIL_PROVIDER ?? "auto")
+    .toLowerCase()
+    .trim();
+  const prefer = preferRaw === "" ? "auto" : preferRaw;
+
+  const order = orderSafetyMailChainHints();
 
   async function attemptSmtp() {
     const smtp = await sendViaConfiguredSmtp(recipient, subject, html, textPlain);
@@ -520,9 +545,26 @@ async function sendParentEmail(to, subject, html, textPlain) {
     };
   }
 
-  if (prefer === "smtp" || prefer === "gmail") {
+  if (prefer === "smtp") {
     return tryChain([attemptSmtp, attemptResend, attemptSendGrid]);
   }
+
+  if (prefer === "gmail") {
+    if (!order.apisReady) {
+      console.warn(
+        "[safety] EMAIL_PROVIDER=gmail with no RESEND_/SENDGRID_ keys — only SMTP will run; Gmail SMTP from Render often fails. Add RESEND_API_KEY + verified RESEND_FROM or set EMAIL_PROVIDER=auto."
+      );
+      return tryChain([attemptSmtp, attemptResend, attemptSendGrid]);
+    }
+    console.log(
+      "[safety] EMAIL_PROVIDER=gmail but transactional API keys exist — trying Resend/SendGrid before Gmail SMTP."
+    );
+    if (order.smtpFirst) {
+      return tryChain([attemptSmtp, attemptResend, attemptSendGrid]);
+    }
+    return tryChain([attemptResend, attemptSendGrid, attemptSmtp]);
+  }
+
   if (prefer === "resend") {
     return tryChain([attemptResend, attemptSendGrid, attemptSmtp]);
   }
@@ -530,25 +572,7 @@ async function sendParentEmail(to, subject, html, textPlain) {
     return tryChain([attemptSendGrid, attemptResend, attemptSmtp]);
   }
 
-  /**
-   * auto: transactional APIs often work more reliably from cloud hosts than consumer Gmail SMTP.
-   * If RESEND_* or SENDGRID_* is set and SAFETY_MAIL_SMTP_FIRST is not "1", try APIs before SMTP so
-   * a flaky Gmail/session does not exhaust the parent's patience (timeouts still bound each attempt).
-   */
-  let smtpReady = false;
-  try {
-    smtpReady = !!getSmtpPingDiagnostics().smtp_ready;
-  } catch (_e) {
-    smtpReady = false;
-  }
-  const hasResend = !!process.env.RESEND_API_KEY?.trim();
-  const hasSg = !!String(process.env.SENDGRID_API_KEY || "").trim();
-  const apisReady = hasResend || hasSg;
-  const smtpFirst =
-    process.env.SAFETY_MAIL_SMTP_FIRST === "1" ||
-    (smtpReady && !apisReady && process.env.SAFETY_MAIL_APIS_FIRST !== "1");
-
-  if (smtpFirst) {
+  if (order.smtpFirst) {
     return tryChain([attemptSmtp, attemptResend, attemptSendGrid]);
   }
   return tryChain([attemptResend, attemptSendGrid, attemptSmtp]);
@@ -584,7 +608,25 @@ router.get("/ping", async (_req, res) => {
         mail.smtp_ready && !String(process.env.RESEND_API_KEY || "").trim() &&
         !String(process.env.SENDGRID_API_KEY || "").trim()
           ? "SMTP only — no Resend/SendGrid keys."
-          : "If EMAIL_PROVIDER is auto and Resend or SendGrid is configured, those run before SMTP (override with SAFETY_MAIL_SMTP_FIRST=1).",
+          : (() => {
+              const ord = orderSafetyMailChainHints();
+              const prov = String(process.env.EMAIL_PROVIDER || "auto")
+                .toLowerCase()
+                .trim() || "auto";
+              const apis =
+                !!String(process.env.RESEND_API_KEY || "").trim() ||
+                !!String(process.env.SENDGRID_API_KEY || "").trim();
+              if (
+                prov === "gmail" &&
+                apis &&
+                !ord.smtpFirst
+              ) {
+                return "EMAIL_PROVIDER=gmail with Resend/SendGrid configured: APIs send first (same as auto). SAFETY_MAIL_SMTP_FIRST=1 forces Gmail SMTP first.";
+              }
+              return ord.smtpFirst
+                ? "Order: SMTP first, then APIs (SAFETY_MAIL_APIS_FIRST=1 or remove SMTP to prefer APIs)."
+                : "Order: Resend → SendGrid → SMTP (unless SAFETY_MAIL_SMTP_FIRST=1). EMAIL_PROVIDER=gmail uses this too when API keys exist.";
+            })(),
     });
   } catch (err) {
     console.error("[safety] ping", err);
