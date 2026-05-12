@@ -146,14 +146,16 @@ function getSmtpPingDiagnostics() {
   }
 
   const hasResend = !!String(process.env.RESEND_API_KEY || "").trim();
+  const hasBrevo = !!String(process.env.BREVO_API_KEY || "").trim();
   const hasSendgrid = !!String(process.env.SENDGRID_API_KEY || "").trim();
+  const hasApis = hasResend || hasBrevo || hasSendgrid;
   /** When smtp looks fine but parent mail still fails — common on Render + Gmail. */
   let safety_email_note = null;
-  if (!hasResend && !hasSendgrid && onRender && smtpReady && gmailMode) {
+  if (!hasApis && onRender && smtpReady && gmailMode) {
     safety_email_note =
       "Render + Gmail SMTP alone is unreliable: Google often blocks or delays logins from datacenter IPs even with an App Password. " +
-      "Fix: add RESEND_API_KEY + RESEND_FROM (verified domain at resend.com), set EMAIL_PROVIDER=auto, redeploy. " +
-      "(With EMAIL_PROVIDER=gmail, Resend/SendGrid still run after SMTP if you add those keys.)";
+      "Fix: add RESEND_API_KEY + RESEND_FROM, or BREVO_API_KEY + BREVO_SENDER_EMAIL (verified in Brevo), or SENDGRID_API_KEY; redeploy. " +
+      "EMAIL_PROVIDER=gmail still uses those APIs before Gmail when keys are present. SAFETY_EMAIL_WEBHOOK_URL is a last-step relay after transports fail.";
   }
 
   return {
