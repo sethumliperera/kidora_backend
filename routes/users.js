@@ -1,8 +1,6 @@
 const express = require("express");
 const router = express.Router();
 const db = require("../db");
-const verifyToken = require("../middleware/authMiddleware");
-const { ensureUsersFcmTokenColumn } = require("../fcmReminders");
 
 
 // ===============================
@@ -43,26 +41,6 @@ router.post("/", async (req, res) => {
   }
 });
 
-// ===============================
-// 📲 PARENT DEVICE FCM (alerts when app is closed)
-// ===============================
-router.post("/save-fcm-token", verifyToken, async (req, res) => {
-  try {
-    const { fcm_token } = req.body;
-    if (!fcm_token || String(fcm_token).trim() === "") {
-      return res.status(400).json({ message: "fcm_token is required" });
-    }
-    await ensureUsersFcmTokenColumn(db);
-    await db.query("UPDATE users SET fcm_token = ? WHERE id = ?", [
-      String(fcm_token).trim(),
-      req.user.id,
-    ]);
-    res.json({ message: "Saved" });
-  } catch (err) {
-    console.error("save parent FCM token:", err);
-    res.status(500).json({ error: "Database error", details: err.message });
-  }
-});
 
 // ===============================
 // ✅ DELETE USER + RELATED DATA
