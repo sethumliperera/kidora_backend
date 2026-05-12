@@ -84,17 +84,6 @@ function transportUsesGoogleSmtpServers() {
   return useNodemailerGmailService();
 }
 
-/** Match safety mail Brevo key cleanup so ping agrees with outbound sends. */
-function normalizedSecretEnv(raw) {
-  if (raw == null) return "";
-  let s = String(raw).replace(/^\ufeff/, "").trim();
-  s = s.replace(/\u200b/g, "").replace(/\s+$/gm, "").trim();
-  if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
-    s = s.slice(1, -1).trim();
-  }
-  return s;
-}
-
 function isLikelyGmailAccount(userRaw) {
   const u = String(userRaw || "")
     .trim()
@@ -322,13 +311,7 @@ function getSmtpPingDiagnostics() {
     }
   }
 
-  const hasResend = !!String(process.env.RESEND_API_KEY || "").trim();
-  const hasBrevo =
-    !!normalizedSecretEnv(process.env.BREVO_API_KEY) ||
-    !!normalizedSecretEnv(process.env.SENDINBLUE_API_KEY);
-  const hasSendgrid = !!String(process.env.SENDGRID_API_KEY || "").trim();
-  const hasApis = hasResend || hasBrevo || hasSendgrid;
-  /** When smtp looks fine but parent mail still fails — common on Render + Gmail. */
+  /** When SMTP looks configured but Gmail from cloud may never deliver inbox. */
   let safety_email_note = null;
 
   const gmailExplicitHostFallback =
@@ -339,9 +322,9 @@ function getSmtpPingDiagnostics() {
 
   const smtpFromIdentityWarning = computeSmtpFromIdentityWarning({ gmailMode, smtpReady });
 
-  if (!hasApis && onRender && smtpReady && gmailMode) {
+  if (onRender && smtpReady && gmailMode) {
     safety_email_note =
-      "Render + Gmail SMTP is often blocked or filtered by Google even when login succeeds: parents may never see mail. Reliable fix: add RESEND_API_KEY + verified RESEND_FROM (resend.com free tier) or SENDGRID_API_KEY. This server retries Gmail on 465 if 587 fails (GMAIL_SMTP_ALT_RETRY=0 disables). Set SMTP_FROM to the same address as SMTP_USER for Gmail.";
+      "Render + Google SMTP (smtp.gmail.com): Google often blocks or silently drops mail from cloud hosts even when SMTP login succeeds. Use the same mailbox in SMTP_FROM and SMTP_USER; this build retries port 465 if 587 fails (GMAIL_SMTP_ALT_RETRY=0 disables). Prefer an SMTP relay for your own domain instead of Google's SMTP when sending from PaaS.";
   }
 
   return {
