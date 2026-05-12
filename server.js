@@ -6,6 +6,7 @@ require("dotenv").config({ path: "./.env" });
 console.log("DB HOST:", process.env.MYSQLHOST);
 console.log("DB USER:", process.env.MYSQLUSER);
 console.log("DB NAME:", process.env.MYSQLDATABASE);
+// Inserts (e.g. safety_search_alerts) go to THIS database — must match where you look in Railway/Render.
 const du = String(process.env.DATABASE_URL || "");
 const duHost = du.match(/@([^/?]+)/);
 console.log(
@@ -14,7 +15,9 @@ console.log(
 );
 
 const { logSmtpStartup } = require("./smtpEnv");
+const { logMailStartup } = require("./mailDelivery");
 logSmtpStartup();
+logMailStartup();
 
 // ===============================
 // IMPORTS
@@ -35,9 +38,6 @@ const server = http.createServer(app);
 // ===============================
 const db = require("./db");
 const { sendReminderPush } = require("./fcmReminders");
-
-const { startWeeklyReportJob } = require("./weeklyReportEmail");
-startWeeklyReportJob();
 
 // ===============================
 // MIDDLEWARE
@@ -66,7 +66,7 @@ const io = new Server(server, {
 app.set("io", io);
 
 // ===============================
-// REMINDER SCHEDULER
+// REMINDER SCHEDULER 🔥
 // ===============================
 setInterval(async () => {
   try {
@@ -93,8 +93,10 @@ setInterval(async () => {
         priority: reminder.priority,
       };
 
+      // ✅ SEND TO CHILD VIA SOCKET (only when app is online)
       io.to(`child_${reminder.child_id}`).emit("new_notification", payload);
 
+      // ✅ PUSH NOTIFICATION (works when app is closed / in background)
       await sendReminderPush(db, reminder.child_id, {
         id: reminder.id,
         title: reminder.title,
@@ -104,6 +106,7 @@ setInterval(async () => {
 
       console.log(`📤 Sent reminder to child_${reminder.child_id}`);
 
+      // ✅ MARK AS SENT
       await db.query(
         `UPDATE reminders SET is_sent = 1, sent_at = NOW() WHERE id = ?`,
         [reminder.id]
@@ -112,7 +115,7 @@ setInterval(async () => {
   } catch (err) {
     console.error("❌ Reminder scheduler error:", err);
   }
-}, 5000);
+}, 5000); // runs every 5 seconds
 
 // ===============================
 // SOCKET HELPERS
@@ -170,7 +173,7 @@ app.get("/", (req, res) => {
 });
 
 // ===============================
-// EXPORT HELPERS
+// EXPORT HELPERS (optional use in routes)
 // ===============================
 app.set("sendToChild", sendToChild);
 app.set("sendToParent", sendToParent);
