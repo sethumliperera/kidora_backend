@@ -200,6 +200,55 @@ function shouldTryAlternateGmailSmtpProfile(err) {
 }
 
 /**
+ * Dedicated transactional relay for **safety alert email only** (Brevo, SendGrid SMTP, SES, etc.).
+ * Use this from Render instead of smtp.gmail.com — Gmail often accepts then never delivers from cloud IPs.
+ *
+ * SAFETY_RELAY_SMTP_HOST, SAFETY_RELAY_SMTP_USER, SAFETY_RELAY_SMTP_PASS (required)
+ * SAFETY_RELAY_SMTP_PORT (default 587), SAFETY_RELAY_SMTP_SECURE (true/false/1)
+ * SAFETY_RELAY_SMTP_FROM — optional From; else SMTP_FROM must be set for a valid envelope.
+ */
+function getSafetyRelaySmtpDiagnostics() {
+  const host = String(readEnvKey("SAFETY_RELAY_SMTP_HOST").value || "").trim();
+  const user = String(readEnvKey("SAFETY_RELAY_SMTP_USER").value || "").trim();
+  const pass = String(readEnvKey("SAFETY_RELAY_SMTP_PASS").value || "").trim();
+  const portRaw = String(readEnvKey("SAFETY_RELAY_SMTP_PORT").value || "").trim();
+  const configured = !!(host && user && pass);
+  return {
+    safety_relay_smtp_configured: configured,
+    safety_relay_smtp_host_set: !!host,
+    safety_relay_smtp_host_preview: configured ? `${host}:${portRaw || "587"}` : null,
+    safety_relay_smtp_quickstart:
+      "Brevo: SMTP relay host smtp-relay.brevo.com:587 STARTTLS — user = your Brevo login email, pass = SMTP key from dashboard. SAFETY_RELAY_SMTP_FROM = a sender you verified in Brevo. SendGrid: host smtp.sendgrid.net, user literal apikey, pass = SG.xxx, FROM = verified sender.",
+  };
+}
+
+async function sendSafetyRelaySmtpMail(mailOptions) {
+  const host = String(readEnvKey("SAFETY_RELAY_SMTP_HOST").value || "").trim();
+  const user = String(readEnvKey("SAFETY_RELAY_SMTP_USER").value || "").trim();
+  const pass = String(readEnvKey("SAFETY_RELAY_SMTP_PASS").value || "").trim();
+  if (!host || !user || !pass) {
+    throw new Error(
+      "SAFETY_RELAY_SMTP_HOST, SAFETY_RELAY_SMTP_USER, and SAFETY_RELAY_SMTP_PASS are required."
+    );
+  }
+  const port = parseInt(readEnvKey("SAFETY_RELAY_SMTP_PORT").value || "587", 10);
+  const secure = parseSmtpSecureRaw(readEnvKey("SAFETY_RELAY_SMTP_SECURE").value);
+  const tx = nodemailer.createTransport({
+    host,
+    port,
+    secure,
+    auth: { user, pass },
+    requireTLS: !secure && port === 587,
+    tls: { minVersion: "TLSv1.2" },
+    connectionTimeout: 22000,
+    greetingTimeout: 22000,
+    socketTimeout: 50000,
+  });
+  console.log(`[smtpEnv] SAFETY_RELAY SMTP send → ${host}:${port} secure=${secure}`);
+  return tx.sendMail(mailOptions);
+}
+
+/**
  * Sends with env SMTP. For explicit smtp.gmail.com, retries 465 SMTPS if env used 587 (and vice‑versa),
  * unless `GMAIL_SMTP_ALT_RETRY=0`.
  */
@@ -322,9 +371,17 @@ function getSmtpPingDiagnostics() {
 
   const smtpFromIdentityWarning = computeSmtpFromIdentityWarning({ gmailMode, smtpReady });
 
+  const relay = getSafetyRelaySmtpDiagnostics();
+  const hasResend = !!String(readEnvKey("RESEND_API_KEY").value || "").trim() &&
+    !!String(readEnvKey("RESEND_FROM").value || "").trim();
+
   if (onRender && smtpReady && gmailMode) {
     safety_email_note =
-      "Render + Google SMTP (smtp.gmail.com): Google often blocks or silently drops mail from cloud hosts even when SMTP login succeeds. Use the same mailbox in SMTP_FROM and SMTP_USER; this build retries port 465 if 587 fails (GMAIL_SMTP_ALT_RETRY=0 disables). Prefer an SMTP relay for your own domain instead of Google's SMTP when sending from PaaS.";
+      "Render + Google SMTP (smtp.gmail.com): Google often blocks or silently drops mail from cloud hosts even when SMTP login succeeds. Use the same mailbox in SMTP_FROM and SMTP_USER; this build retries port 465 if 587 fails (GMAIL_SMTP_ALT_RETRY=0 disables). Reliable fix without changing app code paths: add SAFETY_RELAY_SMTP_HOST + USER + PASS (Brevo/SendGrid/SES SMTP) so safety mails use a transactional relay before Gmail SMTP, or set RESEND_API_KEY + RESEND_FROM.";
+    if (!relay.safety_relay_smtp_configured && !hasResend) {
+      safety_email_note +=
+        " Your ping shows no relay yet — safety emails will still try Gmail SMTP only until you add relay or Resend env vars.";
+    }
   }
 
   return {
@@ -345,6 +402,7 @@ function getSmtpPingDiagnostics() {
     render_service_name: process.env.RENDER_SERVICE_NAME || null,
     render_external_url: process.env.RENDER_EXTERNAL_URL || null,
     render_service_id: process.env.RENDER_SERVICE_ID || null,
+    ...relay,
   };
 }
 
@@ -370,6 +428,8 @@ module.exports = {
   shouldUseGmailServiceTransport,
   getTransporter,
   sendConfiguredSmtpMail,
+  sendSafetyRelaySmtpMail,
+  getSafetyRelaySmtpDiagnostics,
   getSmtpPingDiagnostics,
   logSmtpStartup,
 };
