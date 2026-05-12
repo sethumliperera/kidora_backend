@@ -88,11 +88,6 @@ router.post("/add", async (req, res) => {
       parent_id = insertParent.insertId;
     }
 
-    const emailTrim = String(email).trim();
-    if (emailTrim.includes("@")) {
-      await db.query("UPDATE users SET email = ? WHERE id = ?", [emailTrim, parent_id]);
-    }
-
     const { childId } = generateUniqueCodes();
 
     const [childResult] = await db.query(
