@@ -2,6 +2,7 @@ const express = require("express");
 const router = express.Router();
 const db = require("../db");
 const { resolveSmtpUser, getTransporter, getSmtpPingDiagnostics } = require("../smtpEnv");
+const { notifyParent } = require("../parentNotify");
 
 /** Default substring checks (lowercase). Extend via env BAD_SEARCH_PHRASES=comma,separated */
 const DEFAULT_BLOCKED_PHRASES = [
@@ -479,17 +480,18 @@ router.post("/report-flagged-search", async (req, res) => {
     }
 
     try {
-      await db.query(
-        `INSERT INTO notifications (parent_id, child_id, message, type) VALUES (?, ?, ?, ?)`,
-        [
-          rows[0].parent_id,
-          childId,
-          `${isPrivateBrowsing ? "Incognito/private search" : "Flagged search"} at ${deviceLocalDate || "?"} ${deviceLocalTime || "?"} (${deviceTimezone || "?"}): "${query.slice(0, 100)}${query.length > 100 ? "…" : ""}"`,
-          isPrivateBrowsing ? "safety_search_private" : "safety_search",
-        ]
-      );
+      const alertMessage = `${isPrivateBrowsing ? "Incognito/private search" : "Flagged search"} at ${deviceLocalDate || "?"} ${deviceLocalTime || "?"} (${deviceTimezone || "?"}): "${query.slice(0, 100)}${query.length > 100 ? "…" : ""}"`;
+      await notifyParent({
+        parentId: rows[0].parent_id,
+        childId,
+        message: alertMessage,
+        type: isPrivateBrowsing ? "safety_search_private" : "safety_search",
+        title: isPrivateBrowsing
+          ? "Urgent: Incognito search"
+          : "Urgent: Flagged search",
+      });
     } catch (notifErr) {
-      console.warn("[safety] notification insert", notifErr.message);
+      console.warn("[safety] parent notify", notifErr.message);
     }
 
     return res.json({
