@@ -2,6 +2,7 @@ const express = require("express");
 const router = express.Router();
 const db = require("../db");
 const verifyToken = require("../middleware/authMiddleware");
+const { notifyParent } = require("../parentNotify");
 
 // Auto-create table helper
 async function ensureTable() {
@@ -70,21 +71,8 @@ router.post("/", async (req, res) => {
       (a) => !existingPackages.has(a.package_name)
     );
 
-    // ── Step 3: Create notifications for newly installed apps ──
+    // ── Step 3: Notify parent (DB + FCM push when app is closed) ──
     if (newApps.length > 0 && parentId) {
-      // Ensure notifications table exists
-      await db.query(`
-        CREATE TABLE IF NOT EXISTS notifications (
-          id INT AUTO_INCREMENT PRIMARY KEY,
-          parent_id INT,
-          child_id INT NOT NULL,
-          message TEXT NOT NULL,
-          type VARCHAR(100) DEFAULT 'general',
-          is_read TINYINT DEFAULT 0,
-          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-      `);
-
       for (const app of newApps) {
         const appLabel = app.app_name || app.package_name;
         const category = isSocialOrGaming(app.package_name, app.app_name)
@@ -92,12 +80,15 @@ router.post("/", async (req, res) => {
           : "";
         const message = `Your child just installed ${appLabel}${category}`;
         try {
-          await db.query(
-            "INSERT INTO notifications (parent_id, child_id, message, type) VALUES (?, ?, ?, ?)",
-            [parentId, numericChildId, message, "new_app_installed"]
-          );
+          await notifyParent({
+            parentId,
+            childId: numericChildId,
+            message,
+            type: "new_app_installed",
+            title: "New app installed",
+          });
         } catch (e) {
-          console.error("Failed to create notification:", e.message);
+          console.error("Failed to notify parent:", e.message);
         }
       }
     }
