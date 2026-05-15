@@ -5,6 +5,7 @@ const verifyToken = require("../middleware/authMiddleware");
 const multer = require("multer");
 const path = require("path");
 const crypto = require("crypto");
+const bcrypt = require("bcrypt");
 
 // ===============================
 //  MULTER CONFIG
@@ -34,6 +35,96 @@ const generateUniqueCodes = () => {
 const generateLinkingCode = () => {
   return Math.floor(100000 + Math.random() * 900000).toString();
 };
+
+async function ensureUninstallPinColumn() {
+  try {
+    await db.query(
+      "ALTER TABLE users ADD COLUMN uninstall_pin_hash VARCHAR(255) NULL DEFAULT NULL"
+    );
+  } catch (err) {
+    if (err.errno !== 1060 && !String(err.message || "").includes("Duplicate column")) {
+      console.error("ensureUninstallPinColumn:", err.message);
+    }
+  }
+}
+
+// ===============================
+//  VERIFY PARENT PIN (child device — unlink / uninstall; no Firebase auth)
+// ===============================
+router.post("/verify-uninstall-pin", async (req, res) => {
+  try {
+    await ensureUninstallPinColumn();
+
+    const { child_id, child_public_id, pin } = req.body;
+    const cleanPin = String(pin || "").trim();
+
+    if (!/^\d{4}$/.test(cleanPin)) {
+      return res.status(200).json({
+        valid: false,
+        message: "PIN must be exactly 4 digits",
+      });
+    }
+
+    const idNum =
+      child_id !== undefined && child_id !== null && String(child_id).trim() !== ""
+        ? parseInt(String(child_id).trim(), 10)
+        : null;
+    const pubId =
+      child_public_id != null && String(child_public_id).trim() !== ""
+        ? String(child_public_id).trim()
+        : null;
+
+    if ((idNum == null || Number.isNaN(idNum)) && !pubId) {
+      return res.status(400).json({
+        message: "child_id or child_public_id is required",
+      });
+    }
+
+    let rows;
+    if (idNum != null && !Number.isNaN(idNum)) {
+      [rows] = await db.query(
+        `SELECT u.uninstall_pin_hash
+         FROM children c
+         INNER JOIN users u ON u.id = c.parent_id
+         WHERE c.id = ?`,
+        [idNum]
+      );
+    } else {
+      [rows] = await db.query(
+        `SELECT u.uninstall_pin_hash
+         FROM children c
+         INNER JOIN users u ON u.id = c.parent_id
+         WHERE c.child_id = ?`,
+        [pubId]
+      );
+    }
+
+    if (!rows || rows.length === 0) {
+      return res.status(200).json({
+        valid: false,
+        message: "Device profile not found",
+      });
+    }
+
+    const hash = rows[0].uninstall_pin_hash;
+    if (!hash) {
+      return res.status(200).json({
+        valid: false,
+        message:
+          "Parent has not set a security PIN yet. Ask them to open the parent app and complete signup or Settings.",
+      });
+    }
+
+    const ok = await bcrypt.compare(cleanPin, hash);
+    return res.status(200).json({
+      valid: ok,
+      message: ok ? undefined : "Incorrect PIN",
+    });
+  } catch (err) {
+    console.error("verify-uninstall-pin:", err);
+    res.status(500).json({ message: err.message });
+  }
+});
 
 // ===============================
 //  UPLOAD PHOTO
@@ -453,7 +544,7 @@ router.post("/save-fcm-token", async (req, res) => {
   res.json({ message: "Saved" });
 });
 // ===============================
-// 📅 APP RESTRICTION SCHEDULES
+// APP RESTRICTION SCHEDULES
 // ===============================
 
 // Same as POST: GET must not fail with ER_NO_SUCH_TABLE before the parent has ever saved a schedule.
