@@ -57,6 +57,10 @@ function queryMatchesBlocklist(normalized) {
   return phrases.some((p) => p.length >= 2 && normalized.includes(p));
 }
 
+function shouldAlertParent(normalized) {
+  return queryMatchesBlocklist(normalized);
+}
+
 function escapeHtml(s) {
   return String(s || "")
     .replace(/&/g, "&amp;")
@@ -77,6 +81,7 @@ function buildFlaggedSearchEmailHtml({
   deviceLocalTime,
   deviceTimezone,
   serverReceivedUtc,
+  isPrivateBrowsing = false,
 }) {
   const safeQuery = escapeHtml(query);
   const safeChild = escapeHtml(childName || "Your child");
@@ -92,10 +97,18 @@ function buildFlaggedSearchEmailHtml({
   <div style="max-width:620px;margin:24px auto;padding:0 12px;">
 
     <div style="background:#c62828;color:#fff;padding:16px 20px;border-radius:12px 12px 0 0;font-size:17px;font-weight:800;letter-spacing:.3px;">
-      URGENT — Kidora flagged search
+      URGENT — Kidora ${isPrivateBrowsing ? "private / incognito search alert" : "flagged search"}
     </div>
 
     <div style="background:#fff;padding:22px;border:1px solid #d1c4e9;border-top:none;border-radius:0 0 12px 12px;box-shadow:0 8px 24px rgba(94,53,177,0.12);">
+
+      ${
+        isPrivateBrowsing
+          ? `<p style="margin:0 0 14px;padding:12px 14px;background:#263238;color:#eceff1;border-radius:8px;font-size:13px;font-weight:700;">
+        Detected in <strong>private or incognito browsing</strong> (Chrome, Edge, Brave, Firefox, Samsung Internet, etc.).
+      </p>`
+          : ""
+      }
 
       <p style="margin:0 0 18px;color:#263238;font-size:15px;line-height:1.55;">
         <strong>${safeChild}</strong> typed a flagged search in <strong>${safePkg}</strong>. Details below.
@@ -145,11 +158,12 @@ function buildFlaggedSearchEmailHtml({
         <tr><td style="padding:10px 12px;border:1px solid #e1bee7;font-weight:700;">Time zone</td><td style="padding:10px 12px;border:1px solid #e1bee7;">${safeTz}</td></tr>
         <tr style="background:#f3e5f5;"><td style="padding:10px 12px;border:1px solid #e1bee7;font-weight:700;vertical-align:top;">Searched keyword</td><td style="padding:10px 12px;border:1px solid #e1bee7;font-size:16px;font-weight:800;color:#6a1b9a;">${safeQuery}</td></tr>
         <tr><td style="padding:10px 12px;border:1px solid #e1bee7;font-weight:700;">App / browser</td><td style="padding:10px 12px;border:1px solid #e1bee7;">${safePkg}</td></tr>
+        <tr style="background:#f3e5f5;"><td style="padding:10px 12px;border:1px solid #e1bee7;font-weight:700;">Private / incognito</td><td style="padding:10px 12px;border:1px solid #e1bee7;">${isPrivateBrowsing ? "Yes" : "No"}</td></tr>
         <tr style="background:#fafafa;"><td style="padding:10px 12px;border:1px solid #e1bee7;font-weight:700;">Server received (UTC)</td><td style="padding:10px 12px;border:1px solid #e1bee7;font-size:12px;color:#546e7a;">${safeServerUtc}</td></tr>
       </table>
 
       <p style="margin:14px 0 0;font-size:12px;color:#90a4ae;line-height:1.5;">
-        Detected on-device by Kidora across Google, Chrome, YouTube, Bing, DuckDuckGo and other common search engines. Open the Kidora parent app to review and follow up with your child.
+        Detected on-device by Kidora across Google, Chrome (including incognito), YouTube, Bing, DuckDuckGo and other common search engines. Open the Kidora parent app to review and follow up with your child.
       </p>
 
     </div>
@@ -335,10 +349,12 @@ router.get("/ping", async (_req, res) => {
 // POST /api/safety/report-flagged-search (child device, no parent JWT)
 router.post("/report-flagged-search", async (req, res) => {
   try {
+    const isPrivateBrowsing = req.body?.is_private_browsing === true;
     console.log("[safety] POST report-flagged-search", {
       child_id: req.body?.child_id,
       has_query: typeof req.body?.query === "string",
       source_package: req.body?.source_package,
+      is_private_browsing: isPrivateBrowsing,
     });
 
     await db.query(`
@@ -367,9 +383,10 @@ router.post("/report-flagged-search", async (req, res) => {
       return res.status(400).json({ ok: false, error: "query required" });
     }
 
-    if (!queryMatchesBlocklist(normalized)) {
+    if (!shouldAlertParent(normalized)) {
       console.warn("[safety] reject: not in blocklist", {
         childId,
+        isPrivateBrowsing,
         preview: `${normalized.slice(0, 60)}${normalized.length > 60 ? "…" : ""}`,
       });
       return res.status(400).json({ ok: false, error: "query not in safety list" });
@@ -433,10 +450,13 @@ router.post("/report-flagged-search", async (req, res) => {
       deviceLocalTime,
       deviceTimezone,
       serverReceivedUtc,
+      isPrivateBrowsing,
     });
 
     const kw = query.length > 42 ? `${query.slice(0, 42)}…` : query;
-    const subject = `[URGENT] Kidora: "${kw}" — ${childName || "Child"}`;
+    const subject = isPrivateBrowsing
+      ? `[URGENT] Kidora (Incognito): "${kw}" — ${childName || "Child"}`
+      : `[URGENT] Kidora: "${kw}" — ${childName || "Child"}`;
 
     // Always persist first (same MySQL as process.env.DATABASE_URL on THIS host).
     await db.query(
@@ -464,8 +484,8 @@ router.post("/report-flagged-search", async (req, res) => {
         [
           rows[0].parent_id,
           childId,
-          `Flagged search at ${deviceLocalDate || "?"} ${deviceLocalTime || "?"} (${deviceTimezone || "?"}): "${query.slice(0, 100)}${query.length > 100 ? "…" : ""}"`,
-          "safety_search",
+          `${isPrivateBrowsing ? "Incognito/private search" : "Flagged search"} at ${deviceLocalDate || "?"} ${deviceLocalTime || "?"} (${deviceTimezone || "?"}): "${query.slice(0, 100)}${query.length > 100 ? "…" : ""}"`,
+          isPrivateBrowsing ? "safety_search_private" : "safety_search",
         ]
       );
     } catch (notifErr) {
