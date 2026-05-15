@@ -1,42 +1,7 @@
 /**
- * Send reminder pushes via FCM so the child device gets notified when the app is
- * backgrounded or closed (Socket.IO alone cannot reach a disconnected client).
+ * Child reminder pushes via FCM (works when app is closed).
  */
-const admin = require("firebase-admin");
-
-let _messaging = null;
-let _initAttempted = false;
-
-function getMessaging() {
-  if (_messaging) return _messaging;
-  if (_initAttempted) return null;
-  _initAttempted = true;
-
-  try {
-    if (admin.apps && admin.apps.length) {
-      _messaging = admin.messaging();
-      return _messaging;
-    }
-
-    if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
-      const cred = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
-      admin.initializeApp({
-        credential: admin.credential.cert(cred),
-      });
-    } else {
-      admin.initializeApp();
-    }
-    _messaging = admin.messaging();
-    console.log("Firebase Admin initialized (FCM enabled)");
-  } catch (err) {
-    console.warn(
-      "FCM disabled: set FIREBASE_SERVICE_ACCOUNT_JSON or GOOGLE_APPLICATION_CREDENTIALS —",
-      err.message
-    );
-    return null;
-  }
-  return _messaging;
-}
+const admin = require("./firebaseAdmin");
 
 /**
  * @param {import("mysql2/promise").Pool} db
@@ -44,8 +9,7 @@ function getMessaging() {
  * @param {{ id: number, title: string, message: string, priority?: string }} reminder
  */
 async function sendReminderPush(db, childId, reminder) {
-  const messaging = getMessaging();
-  if (!messaging) return;
+  const messaging = admin.messaging();
 
   const [rows] = await db.query(
     "SELECT fcm_token FROM children WHERE id = ? LIMIT 1",
@@ -97,4 +61,4 @@ async function sendReminderPush(db, childId, reminder) {
   }
 }
 
-module.exports = { sendReminderPush, getMessaging };
+module.exports = { sendReminderPush };
