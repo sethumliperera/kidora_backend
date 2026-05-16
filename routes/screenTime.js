@@ -4,7 +4,7 @@ const db = require("../db");
 const verifyToken = require("../middleware/authMiddleware");
 
 // ===============================
-// 🛠 AUTO-CREATE daily_screen_time TABLE
+//  AUTO-CREATE daily_screen_time TABLE
 // ===============================
 const ensureTable = async () => {
   await db.query(`
@@ -47,8 +47,6 @@ const ensureInstalledAppsTable = async () => {
   `);
 };
 
-const { buildWeeklyInsights } = require("../weeklyInsightAnalysis");
-
 // One row per child + app + calendar day (start_time = local midnight) for history + dashboards
 const ensureAppUsageTable = async () => {
   await db.query(`
@@ -77,7 +75,7 @@ function parseLocalDate(body, query) {
 }
 
 // ===============================
-// 💾 SAVE USAGE (child app: foreground + background service)
+// SAVE USAGE (child app: foreground + background service)
 // POST /api/screen-time/save-usage
 // Body: { child_id, local_date?, total_screen_time, usage: [{ app_name, duration }] }
 // Writes: daily_screen_time (per app per day), daily_screen_time_totals (per child per day),
@@ -163,82 +161,7 @@ router.post("/save-usage", async (req, res) => {
 });
 
 // ===============================
-// 📊 GET WEEKLY APP BREAKDOWN (last N days, default 7)
-// GET /api/screen-time/usage/:child_id/weekly-apps?days=7
-// Returns: { start_date, end_date, days, total_screen_time, total_app_sum_seconds, apps, insights }
-// ===============================
-router.get("/usage/:child_id/weekly-apps", async (req, res) => {
-  try {
-    await ensureTable();
-    await ensureTotalsTable();
-    await ensureInstalledAppsTable();
-
-    const cid = parseInt(String(req.params.child_id), 10);
-    if (!Number.isFinite(cid) || cid <= 0) {
-      return res.status(400).json({ error: "invalid child_id" });
-    }
-
-    const days = Math.min(30, Math.max(1, parseInt(String(req.query.days), 10) || 7));
-    const lookback = days - 1;
-
-    const [rows] = await db.query(
-      `SELECT d.app_name AS package_name,
-              MAX(COALESCE(i.app_name, d.app_name)) AS app_name,
-              SUM(d.duration_seconds) AS duration
-       FROM daily_screen_time d
-       LEFT JOIN installed_apps i
-         ON i.child_id = d.child_id AND i.package_name = d.app_name
-       WHERE d.child_id = ? AND d.date >= DATE_SUB(CURDATE(), INTERVAL ? DAY)
-       GROUP BY d.app_name
-       ORDER BY duration DESC`,
-      [cid, lookback]
-    );
-
-    const apps = rows.map((row) => ({
-      package_name: row.package_name,
-      app_name: row.app_name,
-      duration: parseInt(row.duration, 10) || 0
-    }));
-    const sumApps = apps.reduce((a, b) => a + b.duration, 0);
-    const [tRange] = await db.query(
-      `SELECT
-         DATE_SUB(CURDATE(), INTERVAL ? DAY) AS start_date,
-         CURDATE() AS end_date`,
-      [lookback]
-    );
-    const startD = tRange[0]?.start_date;
-    const endD = tRange[0]?.end_date;
-    const [totalsWeek] = await db.query(
-      `SELECT COALESCE(SUM(total_seconds), 0) AS t
-       FROM daily_screen_time_totals
-       WHERE child_id = ? AND date >= DATE_SUB(CURDATE(), INTERVAL ? DAY)`,
-      [cid, lookback]
-    );
-    const fromTotals = parseInt(totalsWeek[0]?.t, 10) || 0;
-    const total_screen_time = fromTotals > 0 ? fromTotals : sumApps;
-
-    const insights = buildWeeklyInsights(apps, total_screen_time);
-
-    res.json({
-      start_date: startD ? String(startD).slice(0, 10) : null,
-      end_date: endD ? String(endD).slice(0, 10) : null,
-      days,
-      total_screen_time,
-      total_app_sum_seconds: sumApps,
-      apps,
-      insights: {
-        concerns: insights.concerns,
-        positives: insights.positives
-      }
-    });
-  } catch (err) {
-    console.error("GET WEEKLY APPS ERROR:", err);
-    res.status(500).json({ error: "Database error", details: err.message });
-  }
-});
-
-// ===============================
-// 📊 GET USAGE FOR A SPECIFIC DAY
+// GET USAGE FOR A SPECIFIC DAY
 // GET /api/screen-time/usage/:child_id?date=YYYY-MM-DD
 // Returns: { date, total_screen_time, apps: [{ app_name, duration }] }
 // ===============================
@@ -324,7 +247,7 @@ router.get("/usage/:child_id", async (req, res) => {
 });
 
 // ===============================
-// 📅 GET USAGE HISTORY (Last N days)
+// GET USAGE HISTORY (Last N days)
 // GET /api/screen-time/usage/:child_id/history?days=7
 // Returns: [{ date, total_duration }]
 // ===============================
@@ -359,7 +282,83 @@ router.get("/usage/:child_id/history", async (req, res) => {
 });
 
 // ===============================
-// ⏱ CHECK SCREEN TIME (total vs limit)
+// GET PER-APP USAGE ROLLUP (Last N days) — pie chart / weekly mix
+// GET /api/screen-time/usage/:child_id/weekly-apps?days=7
+// Returns: { total_screen_time, apps: [{ package_name?, app_name, duration }] }
+// Same date window as /history?days=N (DATE_SUB … INTERVAL N DAY).
+// ===============================
+router.get("/usage/:child_id/weekly-apps", async (req, res) => {
+  try {
+    await ensureTable();
+    await ensureInstalledAppsTable();
+    await ensureAppUsageTable();
+
+    const cid = parseInt(String(req.params.child_id), 10);
+    const days = parseInt(req.query.days, 10) || 7;
+
+    if (!Number.isFinite(cid) || cid <= 0) {
+      return res.status(400).json({ error: "invalid child_id" });
+    }
+
+    let [results] = await db.query(
+      `SELECT d.app_name AS package_name,
+              COALESCE(MAX(i.app_name), d.app_name) AS app_name,
+              SUM(d.duration_seconds) AS duration
+       FROM daily_screen_time d
+       LEFT JOIN installed_apps i
+         ON i.child_id = d.child_id AND i.package_name = d.app_name
+       WHERE d.child_id = ? AND d.date >= DATE_SUB(CURDATE(), INTERVAL ? DAY)
+       GROUP BY d.app_name
+       ORDER BY duration DESC`,
+      [cid, days]
+    );
+
+    if (results.length === 0) {
+      try {
+        const [fromUsage] = await db.query(
+          `SELECT a.app_name AS package_name,
+                  COALESCE(MAX(i.app_name), a.app_name) AS app_name,
+                  SUM(a.duration_seconds) AS duration
+           FROM app_usage a
+           LEFT JOIN installed_apps i
+             ON i.child_id = a.child_id AND i.package_name = a.app_name
+           WHERE a.child_id = ?
+             AND DATE(a.start_time) >= DATE_SUB(CURDATE(), INTERVAL ? DAY)
+           GROUP BY a.app_name
+           ORDER BY duration DESC`,
+          [cid, days]
+        );
+        if (fromUsage.length > 0) {
+          results = fromUsage;
+        }
+      } catch (e) {
+        console.warn("weekly-apps app_usage fallback:", e.message);
+      }
+    }
+
+    let total = 0;
+    const apps = results.map((row) => {
+      const duration = parseInt(row.duration, 10) || 0;
+      total += duration;
+      return {
+        package_name: row.package_name,
+        app_name: row.app_name,
+        duration
+      };
+    });
+
+    res.json({
+      total_screen_time: total,
+      apps
+    });
+  } catch (err) {
+    console.error("GET WEEKLY APPS ERROR:", err);
+    res.status(500).json({ error: "Database error", details: err.message });
+  }
+});
+
+// ===============================
+// CHECK SCREEN TIME (total vs limit)
 // GET /api/screen-time/check/:child_id
 // Returns: { total_usage, limit, status }
 // ===============================
@@ -418,7 +417,7 @@ router.get("/check/:child_id", async (req, res) => {
 });
 
 // ===============================
-// 🔒 SET DAILY LIMIT
+// SET DAILY LIMIT
 // POST /api/screen-time/set
 // ===============================
 router.post("/set", verifyToken, async (req, res) => {
